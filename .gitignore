@@ -1,0 +1,15 @@
+# AI models (3+ GB) - distributed by copying the folder, not via git
+models/
+
+# Personal, per-user data - never commit
+speak_dictionary.json
+speak_dictionary.json.tmp
+speak_config.json
+speak_config.json.tmp
+speak_config.json.corrupt-*
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/

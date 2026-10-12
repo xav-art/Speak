@@ -1,0 +1,9 @@
+# Speak - Dependency Manifest
+# Tested on Python 3.12 (Windows x64)
+
+sounddevice>=0.5.0
+numpy>=1.26.0
+pywin32>=306
+faster-whisper==1.2.1
+ctranslate2==4.8.2
+llama_cpp_python>=0.3.0

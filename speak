@@ -1,0 +1,5 @@
+#!/usr/bin/env sh
+DIR="$(cd "$(dirname "$0")" && pwd)"
+PY=python
+[ -x "$DIR/.venv/Scripts/python.exe" ] && PY="$DIR/.venv/Scripts/python.exe"
+exec "$PY" -X utf8 "$DIR/speak.py" "$@"
