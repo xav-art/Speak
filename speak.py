@@ -11,6 +11,8 @@ Features:
 - Universal Text Insertion: Pastes or types seamlessly into any app (Outlook, Word, Teams, Chrome, web apps, terminals).
 - Personal Dictionary & Auto-Learning: Your names, jargon and product names are fed into both Whisper and the
   local LLM. Fix a word in any app, select the sentence, tap Ctrl+Alt+L and Speak learns the correction.
+- Meeting Mode: Ctrl+Alt+M records the mic and the system audio (Teams, Zoom, in-room), then writes a
+  transcript labelled "Me", "Person 1", "Person 2"... plus a summary and action items (speak_meeting.py).
 """
 
 import os
@@ -44,6 +46,7 @@ import win32clipboard
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, BASE_DIR)
 from speak_dictionary import Dictionary
+from speak_meeting import MeetingManager
 CONFIG_PATH = os.path.join(BASE_DIR, "speak_config.json")
 MODELS_DIR = os.path.join(BASE_DIR, "models")
 LOCAL_LLM_DIR = os.path.join(MODELS_DIR, "llm")
@@ -274,7 +277,20 @@ def load_config(path=None):
         "speculative_decoding": False,
         "llm_fast_path": True,
         "warm_up": True,
-        "high_priority": True
+        "high_priority": True,
+        "meeting_hotkey": "CTRL+ALT+M",
+        "meeting_model": "small",
+        "meeting_folder": None,
+        "meeting_cleanup": True,
+        "meeting_summary": True,
+        "meeting_keep_audio": False,
+        "meeting_mic": None,
+        "meeting_speaker": None,
+        "meeting_me_threshold": 0.5,
+        "meeting_cluster_threshold": 0.5,
+        "meeting_merge_threshold": 0.6,
+        "meeting_num_speakers": None,
+        "meeting_max_minutes": 240
     }
     if os.path.exists(path):
         try:
@@ -373,6 +389,23 @@ class SpeakApp:
                 log(f"[AI Warning] Failed to initialize local LLM ({e}). Running raw Whisper.")
                 self.local_llm = None
 
+    def load_llm(self, n_ctx):
+        """A separate Qwen instance with a bigger context, for meeting summaries.
+        The GGUF is memory-mapped, so its weights are shared with the dictation
+        instance; only the extra KV cache costs RAM. Returns None when AI is off."""
+        if self.ai_mode == "off":
+            return None
+        path = ensure_local_llm(self.local_model_choice)
+        if not path:
+            return None
+        try:
+            import llama_cpp
+            return llama_cpp.Llama(model_path=path, n_ctx=n_ctx, n_threads=int(self.config.get("llm_threads", 4)),
+                                   n_batch=512, verbose=False)
+        except Exception as e:
+            log(f"[AI Warning] Could not load the summary model ({e}).")
+            return None
+
     def __init__(self, config):
         self.config = config
         self.model_size = config.get("model", "base")
@@ -419,6 +452,9 @@ class SpeakApp:
         self.learn_hotkey_req = str(config.get("learn_hotkey", "CTRL+ALT+L")).upper().replace(" ", "")
         self.last_inserted_text = None
         self.last_language = None
+
+        # Meeting mode: Ctrl+Alt+M records a meeting, transcribed with speaker labels
+        self.meetings = MeetingManager(self, BASE_DIR, MODELS_DIR, download_file, log, ALLOWED_LANGUAGES)
 
         # Ensure model directories exist
         os.makedirs(MODELS_DIR, exist_ok=True)
@@ -691,27 +727,8 @@ class SpeakApp:
             lang_name = ALLOWED_LANGUAGES.get(target_lang, target_lang.upper())
             log(f"[Whisper STT {t_whisper:.2f}s] [{lang_name} ({target_lang}) - {lang_prob*100:.0f}% confidence]: \"{raw_text}\"")
 
-            # Learned mishearings: confirmed ones are replaced right here, the
-            # rest become a one-line hint for the LLM (only when relevant).
-            raw_text, dict_hint, applied = self.dictionary.prepare(raw_text, target_lang)
-            for heard, word in applied:
-                log(f"[Dictionary] '{heard}' -> '{word}' (learned correction)")
-            final_text = raw_text
-
-            # 2. Local AI Formatting & Cleanup
-            if self.ai_mode != "off" and self.local_llm:
-                if self.config.get("llm_fast_path", True) and not dict_hint and not self._needs_llm(raw_text):
-                    final_text = self._light_cleanup(raw_text)
-                    log(f"[Fast path] Short clean phrase, LLM skipped: \"{final_text}\"")
-                else:
-                    enhanced = self.format_text(raw_text, target_lang, dict_hint)
-                    if enhanced:
-                        final_text = enhanced
-                        log(f"[AI Formatted]: \"{final_text}\"")
-
-            # Deterministic safety net: dictionary spellings always win.
-            final_text = self.dictionary.apply_casing(final_text)
-            self.dictionary.note_usage(final_text)
+            # 2. Dictionary + Local AI Formatting & Cleanup
+            final_text = self.clean_text(raw_text, target_lang)
 
             # 3. Universal text insertion into active window
             with self.clipboard_lock:
@@ -727,6 +744,38 @@ class SpeakApp:
         except Exception as e:
             log(f"[Error] Transcription failed: {e}")
             threading.Thread(target=self.play_sound, args=("error",), daemon=True).start()
+
+    def clean_text(self, raw_text, lang, use_llm=True, verbose=True, instructions=None):
+        """Dictionary fixes, Qwen cleanup (or the fast path for short clean
+        phrases), then dictionary casing. Shared by dictation and meeting
+        transcripts; the caller holds engine_lock. Meetings pass verbose=False:
+        they skip the per-turn logs and the usage counts, which rank the
+        user's own dictated words. instructions replaces the dictation system
+        prompt (meetings use a stricter "do not rephrase" one)."""
+        # Learned mishearings: confirmed ones are replaced right here, the
+        # rest become a one-line hint for the LLM (only when relevant).
+        text, dict_hint, applied = self.dictionary.prepare(raw_text, lang)
+        if verbose:
+            for heard, word in applied:
+                log(f"[Dictionary] '{heard}' -> '{word}' (learned correction)")
+
+        if use_llm and self.ai_mode != "off" and self.local_llm:
+            if self.config.get("llm_fast_path", True) and not dict_hint and not self._needs_llm(text):
+                text = self._light_cleanup(text)
+                if verbose:
+                    log(f"[Fast path] Short clean phrase, LLM skipped: \"{text}\"")
+            else:
+                enhanced = self.format_text(text, lang, dict_hint, quiet=not verbose, instructions=instructions)
+                if enhanced:
+                    text = enhanced
+                    if verbose:
+                        log(f"[AI Formatted]: \"{text}\"")
+
+        # Deterministic safety net: dictionary spellings always win.
+        text = self.dictionary.apply_casing(text)
+        if verbose:
+            self.dictionary.note_usage(text)
+        return text
 
     # Words that mean the LLM has real work to do. Anything short without one of
     # these ("yes that sounds good", "tak for i dag") is inserted straight away.
@@ -762,11 +811,11 @@ class SpeakApp:
             text += "."
         return text
 
-    def format_text(self, text, lang, dict_hint=""):
+    def format_text(self, text, lang, dict_hint="", quiet=False, instructions=None):
         if not text or not text.strip():
             return text
         if self.ai_mode == "local" and self.local_llm:
-            return self._format_text_local(text, lang, dict_hint=dict_hint)
+            return self._format_text_local(text, lang, quiet=quiet, dict_hint=dict_hint, instructions=instructions)
         return text
 
     # Long dictations are cleaned in sentence-aligned chunks so we never blow the
@@ -790,21 +839,28 @@ class SpeakApp:
             chunks.append(" ".join(current))
         return chunks
 
-    def _format_text_local(self, text, lang, max_tokens=None, quiet=False, dict_hint=""):
+    def _format_text_local(self, text, lang, max_tokens=None, quiet=False, dict_hint="", instructions=None):
         chunks = self._split_for_llm(text)
         if len(chunks) > 1:
             outputs = []
             for c in chunks:
-                outputs.append(self._format_chunk_local(c, lang, max_tokens, quiet, dict_hint))
+                outputs.append(self._format_chunk_local(c, lang, max_tokens, quiet, dict_hint, instructions))
             return " ".join(o.strip() for o in outputs if o)
-        return self._format_chunk_local(text, lang, max_tokens, quiet, dict_hint)
+        return self._format_chunk_local(text, lang, max_tokens, quiet, dict_hint, instructions)
 
-    def _format_chunk_local(self, text, lang, max_tokens=None, quiet=False, dict_hint=""):
+    def _format_chunk_local(self, text, lang, max_tokens=None, quiet=False, dict_hint="", instructions=None):
         # The hint sits at the very end of the system prompt: the whole prompt
         # before it stays byte-identical between dictations, so llama.cpp
         # reuses its KV cache and only the transcript itself is evaluated.
         dict_suffix = dict_hint or ""
-        if lang == "da":
+        if instructions:
+            prompt = f"""<|im_start|>system
+{instructions}{dict_suffix}<|im_end|>
+<|im_start|>user
+{text}<|im_end|>
+<|im_start|>assistant
+"""
+        elif lang == "da":
             prompt = f"""<|im_start|>system
 Du er en intelligent dikteringsassistent. Rens den indtalte tekst:
 - Fjern fyldord ('øh', 'altså', 'sådan', 'um', 'uh', 'du ved').
@@ -1073,6 +1129,7 @@ You are an intelligent voice dictation assistant. Clean up this spoken transcrip
         return (snapshot, our_seq, time.time()) if snapshot else None
 
     LEARN_HOTKEY_ID = 9
+    MEETING_HOTKEY_ID = 10
 
     def _parse_combo(self, combo):
         """'CTRL+ALT+L' / 'CTRL+SHIFT+F9' -> (modifier flags, virtual key) or None."""
@@ -1194,10 +1251,16 @@ You are an intelligent voice dictation assistant. Clean up this spoken transcrip
             mods, vk = learn
             hotkeys_to_bind.append((self.LEARN_HOTKEY_ID, mods | MOD_NOREPEAT, vk, f"Learn correction ({self.learn_hotkey_req})"))
 
+        # Meeting hotkey (default Ctrl+Alt+M): start / stop recording a meeting
+        meeting = self._parse_combo(self.meetings.hotkey)
+        if meeting:
+            mods, vk = meeting
+            hotkeys_to_bind.append((self.MEETING_HOTKEY_ID, mods | MOD_NOREPEAT, vk, f"Record meeting ({self.meetings.hotkey})"))
+
         success_count = 0
         for hid, mods, vk_code, desc in hotkeys_to_bind:
             if _user32.RegisterHotKey(None, hid, mods, vk_code):
-                if hid == self.LEARN_HOTKEY_ID:
+                if hid in (self.LEARN_HOTKEY_ID, self.MEETING_HOTKEY_ID):
                     self.registered_ids.append(hid)
                     log(f"[Hotkey Registered] {desc} -> ACTIVE")
                     continue
@@ -1255,6 +1318,8 @@ You are an intelligent voice dictation assistant. Clean up this spoken transcrip
                 if msg.message == WM_HOTKEY:
                     if msg.wParam == self.LEARN_HOTKEY_ID:
                         threading.Thread(target=self.learn_from_selection, daemon=True).start()
+                    elif msg.wParam == self.MEETING_HOTKEY_ID:
+                        threading.Thread(target=self.meetings.toggle, daemon=True).start()
                     else:
                         self.toggle_recording()
                 ctypes.windll.user32.TranslateMessage(ctypes.byref(msg))
@@ -1288,6 +1353,8 @@ You are an intelligent voice dictation assistant. Clean up this spoken transcrip
             lang_str = "Auto-detect (Restricted to: English, Danish, German, French)"
         log(f"Language       : {lang_str}")
         log(f"Paste Mode     : {self.paste_mode.upper()} (Auto handles Terminals & Apps)")
+        voice = "voice sample recorded" if os.path.exists(self.meetings.profile_path) else "no voice sample yet (type r, then 2)"
+        log(f"Meetings       : [{self.meetings.hotkey}] to record, {voice}")
         log("Dictation      : [ACTIVE SYSTEM-WIDE] Tap your hotkey to dictate.")
         log("Keep this window open while you use Speak (minimize it). Close it to stop Speak.")
         log("-" * 68)
@@ -1298,6 +1365,7 @@ You are an intelligent voice dictation assistant. Clean up this spoken transcrip
         log("  p  - Change Paste Mode (auto, typing, clipboard)")
         log("  m  - Change Whisper Model (medium, base, small, tiny)")
         log("  l  - Change Language (en, da, de, fr, or auto)")
+        log("  r  - Meetings (record, voice sample, transcribe a file)")
         log("  q  - Quit Application")
         log("-" * 68)
 
@@ -1316,6 +1384,50 @@ You are an intelligent voice dictation assistant. Clean up this spoken transcrip
         log("*" * 68)
         log("")
 
+    def meetings_menu(self):
+        m = self.meetings
+        log("\n--- MEETINGS ---")
+        log(f"Recording      : {'IN PROGRESS' if m.is_recording else 'off'} (hotkey {m.hotkey})")
+        created = m.profile_info()
+        log(f"Voice sample   : {'recorded ' + str(created)[:10] if created else 'not recorded (you appear as a numbered person)'}")
+        log(f"Transcripts    : {m.output_folder()}")
+        if m.current_job or m.jobs.unfinished_tasks:
+            log(f"Transcribing   : {m.jobs.unfinished_tasks} meeting(s) in progress or queued")
+        leftovers = m.leftover_recordings()
+        log("\nOptions:")
+        log(f"  1 - {'Stop' if m.is_recording else 'Start'} recording a meeting (same as {m.hotkey})")
+        log("  2 - Record my voice sample (30 seconds, so transcripts label you as \"Me\")")
+        log("  3 - Transcribe an audio or video file (wav, mp3, m4a, mp4...)")
+        if leftovers:
+            log(f"  4 - Transcribe {len(leftovers)} recorded meeting(s) that were not transcribed yet")
+        log("  5 - Delete my voice sample")
+        log("  6 - Open the transcripts folder")
+        log("  Enter - Return to main menu")
+        sub = input("Choose option [1-6]: ").strip()
+        if sub == "1":
+            m.toggle()
+        elif sub == "2":
+            m.enroll_interactive()
+        elif sub == "3":
+            p = input("Path to the audio or video file: ").strip().strip('"')
+            if os.path.isfile(p) or os.path.isdir(p):
+                m.submit(p)
+                log("[Meeting] Queued. Transcribing in the background; dictation keeps working meanwhile.")
+            else:
+                log("File not found.")
+        elif sub == "4" and leftovers:
+            for folder in leftovers:
+                m.submit(folder)
+            log(f"[Meeting] Queued {len(leftovers)} recording(s) for transcription.")
+        elif sub == "5":
+            m.delete_profile()
+        elif sub == "6":
+            os.makedirs(m.output_folder(), exist_ok=True)
+            try:
+                os.startfile(m.output_folder())
+            except Exception as e:
+                log(f"Could not open the folder: {e}")
+
     def run(self, first_run=False):
         listener_thread = threading.Thread(target=self._listener_loop, daemon=True)
         listener_thread.start()
@@ -1323,11 +1435,14 @@ You are an intelligent voice dictation assistant. Clean up this spoken transcrip
         self.print_status_banner()
         if first_run:
             self.print_welcome()
+        leftovers = self.meetings.leftover_recordings()
+        if leftovers:
+            log(f"[Meeting] {len(leftovers)} recorded meeting(s) not transcribed yet. Type r, then 4, to transcribe them.")
 
         try:
             while self.running:
                 try:
-                    cmd = input("Command [h/a/d/p/m/l/q] > ").strip().lower()
+                    cmd = input("Command [h/a/d/p/m/l/r/q] > ").strip().lower()
                 except (EOFError, KeyboardInterrupt):
                     break
 
@@ -1483,16 +1598,21 @@ You are an intelligent voice dictation assistant. Clean up this spoken transcrip
                     log(f"Language set to: {lang_label}")
                     self.print_status_banner()
 
+                elif cmd in ("r", "rec", "meeting", "meetings"):
+                    self.meetings_menu()
+                    self.print_status_banner()
+
                 elif cmd in ("q", "quit", "exit"):
                     log("Exiting...")
                     break
                 else:
-                    log("Unknown command. Type 'h' (hotkey), 'a' (AI formatting), 'd' (dictionary), 'p' (paste mode), 'm' (model), 'l' (language), 'q' (quit).")
+                    log("Unknown command. Type 'h' (hotkey), 'a' (AI formatting), 'd' (dictionary), 'p' (paste mode), 'm' (model), 'l' (language), 'r' (meetings), 'q' (quit).")
 
         except KeyboardInterrupt:
             pass
         finally:
             self.running = False
+            self.meetings.shutdown()
             self.unregister_hotkeys()
             try:
                 self.jobs.put(None)
@@ -1515,10 +1635,25 @@ if __name__ == "__main__":
                         help="AI formatting mode: 'local' (100%% offline) or 'off'.")
     parser.add_argument("--download-models", action="store_true",
                         help="Download the models the current settings need, then exit (used by the installer).")
+    parser.add_argument("--transcribe-meeting", metavar="PATH", default=None,
+                        help="Transcribe a meeting with speaker labels, then exit. PATH is an audio or video "
+                             "file, or a Speak recording folder.")
     args = parser.parse_args()
 
     if args.download_models:
         sys.exit(0 if download_models(load_config()) else 1)
+
+    if args.transcribe_meeting:
+        # Runs next to a Speak window too: no hotkeys, no mutex, config not saved.
+        cfg = load_config()
+        cfg["warm_up"] = False
+        app = SpeakApp(cfg)
+        try:
+            app.meetings.process(os.path.abspath(args.transcribe_meeting))
+        except Exception as e:
+            log(f"[Meeting Error] {e}")
+            sys.exit(1)
+        sys.exit(0)
 
     prepare_console()
     # Single-instance check via Win32 Mutex
