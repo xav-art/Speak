@@ -24,11 +24,12 @@ Everything runs on your own CPU. No audio or text leaves your computer, there is
 
 ## Features
 
-- **100% offline and private.** Audio and transcripts stay in your computer's memory. Nothing is sent to a server.
+- **100% offline and private.** Audio and transcripts never leave your computer. Nothing is sent to a server.
 - **Works in any app.** Text is pasted or typed into whichever window has focus. Terminals and legacy apps that reject Ctrl+V get direct typing instead.
 - **Cleans up how people actually talk.** Removes fillers (*um, uh, øh, altså, äh, euh*), fixes stutters and false starts, and turns spoken commands like *"bullet point"* and *"new line"* into real formatting.
 - **Multilingual.** English, Danish, German and French, auto-detected or locked to one language.
 - **Learns your words.** Add names, products and jargon to a personal dictionary. If Speak mishears a word, fix it in your document, select the sentence, press **Ctrl+Alt+L**, and Speak remembers the correction.
+- **Meeting transcripts.** Press **Ctrl+Alt+M** to record a Teams, Zoom or in-room meeting. Speak writes a transcript that shows who said what (*Me*, *Person 1*, *Person 2*...), with a summary and action items. Also offline.
 - **No admin rights.** Runs entirely in Windows user space, with no services, drivers or firewall prompts.
 - **Fast on a laptop CPU.** Short phrases appear in about 1 second, and longer dictations in about 2 to 3 seconds.
 
@@ -88,8 +89,8 @@ Open the Start Menu and choose **Uninstall Speak**. It asks whether to keep your
 
 - Windows 10 or 11 (64-bit)
 - A microphone
-- About 2 GB of free disk space and 4 GB of RAM or more
-- Internet access during setup only
+- About 2 GB of free disk space and 4 GB of RAM or more (meeting mode: about 0.6 GB more, downloaded the first time you use it)
+- Internet access during setup only (and once, the first time you record a meeting)
 
 ### For developers
 
@@ -118,6 +119,7 @@ Start Speak from its Desktop or Start Menu icon, or double-click `start_speak.ba
 | :--- | :--- |
 | **`<`** | Start recording. Tap again to stop and insert the text. |
 | **`Ctrl+Alt+L`** | Learn a correction: after fixing a misheard word, select the sentence and press this. |
+| **`Ctrl+Alt+M`** | Start recording a meeting. Press again to stop; the transcript is written in the background. |
 
 Type these in the Speak window:
 
@@ -129,6 +131,7 @@ Type these in the Speak window:
 | `l` | Language: auto-detect, or lock to English, Danish, German or French |
 | `m` | Whisper model: `base` (fast) or `medium` (more accurate) |
 | `p` | Paste mode: `auto`, `typing` or `clipboard` |
+| `r` | Meetings: start or stop a recording, record your voice sample, transcribe an audio or video file |
 | `q` | Quit |
 
 Command-line options: `--hotkey`, `--model`, `--language`, `--paste-mode`, `--ai-mode`. Run `speak --help` for details.
@@ -150,6 +153,39 @@ What Speak does with your words:
 
 Auto-learn ignores rewrites (more than half the words changed), everyday words, and anything shorter than three letters.
 
+## Meetings
+
+Speak can record a meeting and write a transcript that shows who said what:
+
+```markdown
+**[00:00:31] Me:** Okay, so the photos and the discount bug are the two blockers. Can you chase the studio today?
+**[00:00:40] Person 1:** Yes, I will call them after this meeting and send an update before lunch.
+**[00:00:46] Person 2:** Hej alle sammen. Har vi nok varer i Aarhus til lanceringen?
+```
+
+1. **Once:** type `r`, then `2`, and talk for 30 seconds. Speak stores a voice fingerprint (numbers, not audio) so it can label you as **Me**.
+2. Press **Ctrl+Alt+M** when the meeting starts. Tell the other participants that you are recording.
+3. Press **Ctrl+Alt+M** again when it ends. Speak transcribes in the background while you keep working (dictation still works), beeps, and saves the transcript to `C:\Users\<you>\Documents\Speak Meetings`. This is the local Documents folder on purpose: if Windows syncs your Documents to OneDrive, transcripts still stay on this PC.
+
+It works for Teams, Zoom and Meet calls, in-room meetings around your laptop, and a mix of both. Speak records two things side by side: your microphone (you and anyone in the room) and your computer's sound output (everyone in the call). It never joins or connects to the call.
+
+The transcript file has the date, length and speakers at the top, then a **summary**, **decisions** and **action items**, then the full transcript. Rename speakers with find and replace (`Person 1` to `Anna`). You can also transcribe an existing audio or video file: type `r`, then `3`.
+
+How it works:
+
+- **Who spoke when:** [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) speaker diarization (pyannote segmentation and NeMo TitaNet speaker embeddings, about 47 MB, no PyTorch). Speakers that match your voice sample become *Me*, everyone else *Person 1*, *Person 2* and so on, numbered in order of appearance.
+- **What was said:** Whisper `small` (more accurate on long, mixed audio than the dictation model). Each speaker's language is detected separately, so a Danish colleague stays Danish in an English meeting.
+- **Cleanup:** only turns with fillers or stutters go to Qwen, with a strict "do not rephrase" prompt. If the model changes the meaning anyway, the turn is kept as spoken.
+- **Decisions and action items:** Speak finds the sentences where someone promises something (*"I will"*, *"jeg vil"*), asks for something (*"can you"*, *"kan du"*) or agrees on something (*"let us"*, *"lad os"*). Qwen then rewrites each one as a short to-do with its deadline. The owner comes from the transcript, not from the AI: whoever made the promise, or whoever said yes to a request. A request nobody agreed to is listed with who raised it. Every item shows when it was said, so you can check it.
+- **Summary:** Qwen writes a short summary paragraph. It is a small model, so read it before you forward it.
+
+Tips:
+
+- **Use a headset in calls.** Without one, the call also comes out of your speakers into the microphone. Speak detects this and ignores the microphone while remote people talk, so nobody is transcribed twice, but it then cannot hear you or the room when you talk over a remote person.
+- Speak records the Windows **default** microphone and speakers. If Teams uses other devices (Teams settings > Devices), set `meeting_mic` and `meeting_speaker` to part of their names.
+- Processing takes about half the meeting's length on a laptop CPU: a 10-minute test meeting took 5 minutes on an Intel Core Ultra 7, so plan on about 30 minutes for an hour. The first meeting also downloads about 0.5 GB of models.
+- If Speak is closed during a recording, the audio is kept. Start Speak again and type `r`, then `4`, to transcribe it.
+
 ## Configuration
 
 Settings are saved to `speak_config.json` when you change them in the app. You can also edit the file directly:
@@ -168,6 +204,19 @@ Settings are saved to `speak_config.json` when you change them in the app. You c
 | `llm_fast_path` | `true` | Skip the AI step for short, clean phrases |
 | `warm_up` | `true` | Warm up both models at startup so the first dictation is fast |
 | `high_priority` | `true` | Run at above-normal priority so busy apps do not slow processing down |
+| `meeting_hotkey` | `CTRL+ALT+M` | Hotkey that starts and stops a meeting recording |
+| `meeting_model` | `small` | Whisper model for meetings |
+| `meeting_folder` | `null` | Where transcripts go. `null` means the local `C:\Users\<you>\Documents\Speak Meetings` (never the OneDrive one) |
+| `meeting_cleanup` | `true` | Remove fillers and stutters from meeting turns with Qwen |
+| `meeting_summary` | `true` | Write a summary, decisions and action items |
+| `meeting_keep_audio` | `false` | Keep the recorded audio after the transcript is written |
+| `meeting_mic` | `null` | Microphone for meetings (part of its name). `null` means the Windows default |
+| `meeting_speaker` | `null` | Speakers or headset to record the call from (part of its name). `null` means the Windows default |
+| `meeting_num_speakers` | `null` | Number of people, if you know it. `null` means detect automatically |
+| `meeting_me_threshold` | `0.5` | How closely a voice must match your voice sample to be labelled *Me* |
+| `meeting_cluster_threshold` | `0.5` | Speaker separation: lower finds more distinct speakers |
+| `meeting_merge_threshold` | `0.6` | Two detected voices this similar are joined into one person |
+| `meeting_max_minutes` | `240` | A recording stops automatically after this long |
 
 ## Performance notes
 
@@ -190,6 +239,7 @@ Tested and rejected (kept as opt-in config keys): prompt-lookup speculative deco
 Speak/
 ├── speak.py                  # The app: recording, transcription, AI cleanup, text insertion
 ├── speak_dictionary.py       # Personal dictionary and learning from corrections
+├── speak_meeting.py          # Meeting mode: recording, speaker detection, transcript, summary
 ├── test_speak.py             # Unit tests
 ├── requirements.txt          # Python dependencies
 ├── install.ps1               # Installer, updater and uninstaller (no admin rights)
@@ -200,10 +250,11 @@ Speak/
 ├── install_dependencies.bat  # Old name for setup.cmd, kept for existing users
 ├── assets/                   # App icon
 ├── docs/screenshots/         # Images used in this README
-└── models/                   # Downloaded models (not in git)
+├── models/                   # Downloaded models (not in git)
+└── recordings/               # Meeting audio waiting to be transcribed (not in git)
 ```
 
-`speak_config.json`, `speak_dictionary.json`, `.venv/` and `models/` are personal, generated or large, so they are ignored by git.
+`speak_config.json`, `speak_dictionary.json`, `speak_voice.json`, `.venv/`, `models/` and `recordings/` are personal, generated or large, so they are ignored by git.
 
 ## Running the tests
 
@@ -213,7 +264,9 @@ Speak/
 
 ## Privacy
 
-Speak makes network requests only during setup and to download a model from Hugging Face the first time you use it. Recording, transcription, cleanup and your dictionary stay on your machine. The microphone is open only between your two hotkey taps.
+Speak makes network requests only during setup and to download a model the first time you use it (from Hugging Face, and the speaker models from the sherpa-onnx GitHub releases, checked against SHA-256). Recording, transcription, cleanup and your dictionary stay on your machine. The microphone is open only between your two hotkey taps.
+
+Meeting mode records the microphone and the sound your computer plays, only between two presses of the meeting hotkey; the console title shows **RECORDING MEETING** meanwhile. The audio is written to `recordings\` and deleted as soon as the transcript is saved (unless you set `meeting_keep_audio`). Your voice sample is stored in `speak_voice.json` as a list of numbers that describes your voice, not as audio; delete it with `r`, then `5`. Recording other people can require their consent, and your company may have rules about recording meetings: always tell participants that you are recording.
 
 ## License
 

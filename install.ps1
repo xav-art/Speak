@@ -203,17 +203,17 @@ function Invoke-Uninstall([string] $dir) {
     Set-UserPath $dir $false
     Write-Ok 'Shortcuts and PATH entry removed.'
 
-    $answer = Read-Host '    Also delete your personal dictionary and settings? Type YES to delete them, or press Enter to keep them'
+    $answer = Read-Host '    Also delete your personal dictionary, settings, voice sample and untranscribed meeting recordings? Type YES to delete them, or press Enter to keep them'
     Set-Location $env:TEMP
     $keep = @()
-    if ($answer -cne 'YES') { $keep = @('speak_config.json', 'speak_dictionary.json') }
+    if ($answer -cne 'YES') { $keep = @('speak_config.json', 'speak_dictionary.json', 'speak_voice.json', 'recordings') }
     Get-ChildItem -LiteralPath $dir -Force | Where-Object { $keep -notcontains $_.Name } |
         Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
     if (-not (Get-ChildItem -LiteralPath $dir -Force -ErrorAction SilentlyContinue)) {
         Remove-Item -LiteralPath $dir -Force -ErrorAction SilentlyContinue
         Write-Ok 'Speak has been removed.'
     } else {
-        Write-Ok "Speak has been removed. Your dictionary and settings are still in $dir"
+        Write-Ok "Speak has been removed. Your dictionary, settings and voice sample are still in $dir"
     }
 }
 
@@ -248,7 +248,7 @@ function Invoke-Install {
         Write-Ok 'Using the files in this folder.'
     } elseif ($localSource) {
         New-Item -ItemType Directory -Force -Path $dir | Out-Null
-        Copy-Item -Path (Join-Path $PSScriptRoot '*') -Destination $dir -Recurse -Force -Exclude '.git', '.venv', 'models', '__pycache__', 'speak_config.json*', 'speak_dictionary.json*'
+        Copy-Item -Path (Join-Path $PSScriptRoot '*') -Destination $dir -Recurse -Force -Exclude '.git', '.venv', 'models', '__pycache__', 'speak_config.json*', 'speak_dictionary.json*', 'speak_voice.json*', 'recordings'
         Write-Ok "Copied from $PSScriptRoot"
     } else {
         Get-SpeakSource $dir $Branch

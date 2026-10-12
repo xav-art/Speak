@@ -7,6 +7,11 @@ speak_dictionary.json.tmp
 speak_config.json
 speak_config.json.tmp
 speak_config.json.corrupt-*
+speak_voice.json
+speak_voice.json.tmp
+
+# Meeting audio waiting to be transcribed (deleted after transcription)
+recordings/
 
 # Python
 __pycache__/

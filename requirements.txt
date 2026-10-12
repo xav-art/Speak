@@ -7,3 +7,6 @@ pywin32>=306
 faster-whisper==1.2.1
 ctranslate2==4.8.2
 llama_cpp_python>=0.3.0
+# Meeting mode: speaker diarization (ONNX, no PyTorch) and system-audio loopback capture
+sherpa-onnx==1.13.8
+soundcard==0.4.6
