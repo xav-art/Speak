@@ -196,12 +196,13 @@ Settings are saved to `speak_config.json` when you change them in the app. You c
 | `learn_hotkey` | `CTRL+ALT+L` | Hotkey that learns a correction |
 | `model` | `base` | Whisper model: `tiny`, `base`, `small`, `medium` |
 | `language` | `null` | `null` for auto-detect, or `en`, `da`, `de`, `fr` |
+| `language_check_short_phrases` | `true` | For phrases of up to 4 seconds that Whisper hears as another language than your last one, also try your last language, and keep it if Whisper is clearly more sure of it |
 | `ai_mode` | `local` | `local` (Qwen) or `off` (raw Whisper) |
 | `local_model` | `1.5b` | `1.5b` or `0.5b` |
 | `paste_mode` | `auto` | `auto`, `typing` or `clipboard` |
 | `whisper_threads` | `4` | CPU threads for Whisper |
 | `llm_threads` | `6` | CPU threads for Qwen |
-| `llm_fast_path` | `true` | Skip the AI step for short, clean phrases |
+| `llm_fast_path` | `true` | Skip the AI step for short, clean phrases. A filler at the start (*um*, *øh*) does not stop a phrase from counting as clean: Speak removes it itself |
 | `warm_up` | `true` | Warm up both models at startup so the first dictation is fast |
 | `high_priority` | `true` | Run at above-normal priority so busy apps do not slow processing down |
 | `meeting_hotkey` | `CTRL+ALT+M` | Hotkey that starts and stops a meeting recording |
@@ -225,7 +226,9 @@ Measured on an Intel Core Ultra 7 265U with `faster-whisper-base` and Qwen 2.5 1
 | Optimization | Effect |
 | :--- | :--- |
 | One encoder pass for language detection and transcription | Whisper stage **40 to 60% faster** (faster-whisper otherwise encodes the same 30 s window twice) |
-| Fast path for short, clean phrases (8 words or fewer, no fillers, commands or numbers) | Language model skipped, text inserted in about 1 s |
+| Fast path for short, clean phrases (8 words or fewer, no fillers, commands or numbers). A filler at the start is removed by Speak itself, and filler lists are per language ("er" is a filler in English, "is" in Danish) | Language model skipped. In the benchmark, all short phrases now skip it (was about half), and they are inserted about 40% faster |
+| Clipboard restored on a timer after a paste | The next dictation no longer waits 0.8 s after every paste |
+| Short-phrase language check | A phrase of up to 4 s that Whisper hears as another language than your last one is decoded in both, greedily. Fixes short phrases such as *"Det er fint med mig"* that Whisper hears as German. Costs about 0.2 to 0.3 s, only when the languages disagree |
 | Engines warmed up at startup | The first dictation is as fast as the rest |
 | `ABOVE_NORMAL` process priority | Chrome, Teams and Outlook cannot take the CPU during the ~2 s of processing |
 | Direct typing sends 32 characters per `SendInput` call | Insertion into terminals is about 20x faster |
@@ -239,8 +242,10 @@ Tested and rejected (kept as opt-in config keys): prompt-lookup speculative deco
 Speak/
 ├── speak.py                  # The app: recording, transcription, AI cleanup, text insertion
 ├── speak_dictionary.py       # Personal dictionary and learning from corrections
+├── speak_text.py             # Text rules: fast path, fillers, filter for text Whisper invents
 ├── speak_meeting.py          # Meeting mode: recording, speaker detection, transcript, summary
 ├── test_speak.py             # Unit tests
+├── bench/                    # Speed and accuracy benchmark with synthetic voice clips
 ├── requirements.txt          # Python dependencies
 ├── install.ps1               # Installer, updater and uninstaller (no admin rights)
 ├── setup.cmd                 # Double-click to run install.ps1 in this folder
@@ -259,8 +264,20 @@ Speak/
 ## Running the tests
 
 ```powershell
-.venv\Scripts\python test_speak.py
+.venv\Scripts\python -m unittest test_speak
 ```
+
+## Benchmark
+
+`bench/` measures speed and accuracy on 33 clips (English, Danish, German and French speech, and three clips with no speech at all). The clips are made with Windows and [Piper](https://github.com/rhasspy/piper) voices, so no real person's voice is recorded. The benchmark runs the real dictation pipeline but types nothing, never writes your settings and does not use your personal dictionary.
+
+```powershell
+.venv\Scripts\python -X utf8 bench\run_bench.py --label my-change --repeat 3
+.venv\Scripts\python -X utf8 bench\run_bench.py --scenario other      # you just switched language
+.venv\Scripts\python -X utf8 bench\run_bench.py --compare bench\results\A.json bench\results\B.json
+```
+
+It reports the word error rate (WER) per language and clip type, how often the language was detected correctly, how often the AI step was skipped, the time per stage, and any text invented on the no-speech clips. Whisper and Qwen use fixed random seeds, so most clips give the same text every run. A few hard clips do not: when Whisper is unsure it re-decodes with random sampling, which the seed does not fully control. Expect the overall WER to move by about 1.5 points between identical runs, and look at which clips changed (`--compare`) before trusting a small difference. Timings depend on what else the computer is doing: compare runs made one after the other. To rebuild the clips, see `bench\make_clips.py`.
 
 ## Privacy
 

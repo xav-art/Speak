@@ -13,6 +13,7 @@ import numpy as np
 
 import speak_dictionary as sd
 import speak_meeting as sm
+import speak_text as st
 import speak
 
 
@@ -141,29 +142,6 @@ class TestSpeakConfigAndFormatting(unittest.TestCase):
         mods_f, vk_f = dummy_app._parse_combo("CTRL+SHIFT+F9")
         self.assertEqual(mods_f, speak.MOD_CONTROL | speak.MOD_SHIFT)
         self.assertEqual(vk_f, speak.FUNCTION_KEYS["F9"])
-
-    def test_needs_llm_fast_path(self):
-        dummy_app = object.__new__(speak.SpeakApp)
-        # Short clean phrases skip LLM
-        self.assertFalse(dummy_app._needs_llm("Yes that sounds good."))
-        self.assertFalse(dummy_app._needs_llm("Tak for i dag."))
-
-        # Phrases with verbal fillers require LLM
-        self.assertTrue(dummy_app._needs_llm("um yes that is right"))
-        self.assertTrue(dummy_app._needs_llm("øh det tror jeg nok"))
-
-        # Stutters require LLM
-        self.assertTrue(dummy_app._needs_llm("we should go to the the store"))
-
-        # Spoken commands require LLM
-        self.assertTrue(dummy_app._needs_llm("send email bullet point now"))
-        self.assertTrue(dummy_app._needs_llm("first line new line second line"))
-
-        # Numbers require LLM
-        self.assertTrue(dummy_app._needs_llm("order 55 items"))
-
-        # Phrases longer than 8 words require LLM
-        self.assertTrue(dummy_app._needs_llm("one two three four five six seven eight nine ten"))
 
     def test_split_for_llm(self):
         dummy_app = object.__new__(speak.SpeakApp)
@@ -513,6 +491,12 @@ class TestMeetingTurnRepair(unittest.TestCase):
         self.assertFalse(sm.needs_cleanup("We should ship it on Friday."))
         self.assertFalse(sm.needs_cleanup("I mean the plan, like the old one."))   # normal words, not disfluencies
 
+    def test_needs_cleanup_is_language_aware(self):
+        # "er" is "is" in Danish: it once sent nearly every Danish turn to Qwen.
+        self.assertFalse(sm.needs_cleanup("Det er fint, vi ses i morgen.", "da"))
+        self.assertFalse(sm.needs_cleanup("Er ist heute nicht da.", "de"))
+        self.assertTrue(sm.needs_cleanup("So er we should ship it", "en"))
+
 
 class TestMeetingAudioFiles(unittest.TestCase):
     def setUp(self):
@@ -584,6 +568,388 @@ class TestSharedCleanup(unittest.TestCase):
         self.assertEqual(app.dictionary.noted, [])
         app.clean_text("we use sales force", "en")
         self.assertEqual(app.dictionary.noted, ["we use Salesforce"])
+
+
+class TestFastPath(unittest.TestCase):
+    """speak_text.needs_llm decides whether a dictation waits for Qwen."""
+
+    def assertFast(self, text, lang):
+        self.assertFalse(st.needs_llm(st.strip_leading_fillers(text), lang), text)
+
+    def assertSlow(self, text, lang):
+        self.assertTrue(st.needs_llm(st.strip_leading_fillers(text), lang), text)
+
+    def test_everyday_short_replies_skip_the_llm(self):
+        # These were all sent to Qwen because "no", "mean", "like", "wait",
+        # "er" (Danish "is") and "also" (German "so") were treated as fillers.
+        self.assertFast("No, thank you.", "en")
+        self.assertFast("What do you mean?", "en")
+        self.assertFast("I like that idea.", "en")
+        self.assertFast("Can you wait for me?", "en")
+        self.assertFast("Nej tak.", "da")
+        self.assertFast("Det er fint med mig.", "da")
+        self.assertFast("Hvornår er du tilbage?", "da")
+        self.assertFast("Das ist also kein Problem.", "de")
+        self.assertFast("Er kommt morgen.", "de")
+        self.assertFast("Oui, ça me va.", "fr")
+
+    def test_leading_filler_is_removed_without_the_llm(self):
+        self.assertFast("Um, yes that is right.", "en")
+        self.assertFast("Øh, det tror jeg nok.", "da")
+        self.assertEqual(st.strip_leading_fillers("Um, I think so."), "I think so.")
+        self.assertEqual(st.strip_leading_fillers("uh um... yes."), "Yes.")
+        self.assertEqual(st.strip_leading_fillers("Fine. Øh, jeg kommer."), "Fine. Jeg kommer.")
+        self.assertEqual(st.strip_leading_fillers("Um."), "")
+        # Words that merely start like a filler are kept.
+        self.assertEqual(st.strip_leading_fillers("Umbrella first."), "Umbrella first.")
+        # Hyphenated words and other punctuation after a filler.
+        self.assertEqual(st.strip_leading_fillers("Uh-huh, I agree."), "Uh-huh, I agree.")
+        self.assertEqual(st.strip_leading_fillers("Øh- ja"), "Øh- ja")
+        self.assertEqual(st.strip_leading_fillers("Um - yes, I think so."), "Yes, I think so.")
+        self.assertEqual(st.strip_leading_fillers("Um – ja."), "Ja.")
+        self.assertEqual(st.strip_leading_fillers("Um; yes"), "Yes")
+        # Words with their own casing keep it.
+        self.assertEqual(st.strip_leading_fillers("Um, iPhone is good."), "iPhone is good.")
+        self.assertEqual(st.strip_leading_fillers("Uhm... eBay is fine."), "eBay is fine.")
+        # Fillers in the middle are left for the LLM, and nothing else is touched.
+        self.assertEqual(st.strip_leading_fillers("We should, uh, go. e.g. later"), "We should, uh, go. e.g. later")
+
+    def test_real_work_still_goes_to_the_llm(self):
+        self.assertSlow("We should, uh, move it.", "en")                 # filler mid-sentence
+        self.assertSlow("we should go to the the store", "en")           # stutter
+        self.assertSlow("send email bullet point now", "en")             # command
+        self.assertSlow("first line new line second line", "en")
+        self.assertSlow("Hej Anna, ny linje tak for i går.", "da")
+        self.assertSlow("Hi team, neue Zeile danke.", "en")              # commands in any language
+        self.assertSlow("order 55 items", "en")                          # numbers
+        self.assertSlow("one two three four five six seven eight nine ten", "en")
+        self.assertSlow("It was, like, huge.", "en")                     # soft filler set off by commas
+        self.assertSlow("Altså, det er fint.", "da")
+        self.assertSlow("Also, ich weiß nicht.", "de")
+        self.assertSlow("It is fine, you know.", "en")                   # filler phrase
+        self.assertSlow("Det er, du ved, fint.", "da")
+        self.assertSlow("So er we go.", "en")                            # English-only filler
+        # Single-word commands the cleanup prompts tell Qwen to act on.
+        self.assertSlow("I agree period", "en")
+        self.assertSlow("That is great exclamation point", "en")
+        self.assertSlow("next paragraph thanks", "en")
+        self.assertSlow("delete that", "en")
+        self.assertSlow("Hallo Anna Absatz danke", "de")
+        self.assertSlow("Hej Anna, afsnit tak", "da")
+        self.assertSlow("Bonjour à la ligne merci", "fr")
+
+    def test_light_cleanup(self):
+        self.assertEqual(st.light_cleanup("  yes   that works "), "Yes that works.")
+        self.assertEqual(st.light_cleanup("Is it?"), "Is it?")
+        self.assertEqual(st.light_cleanup(""), "")
+
+
+class TestHallucinationFilter(unittest.TestCase):
+    def test_complete_signoffs_are_always_dropped(self):
+        for text in ("Thanks for watching!", "Thank you so much for watching. Bye!", "Please subscribe.",
+                     "Tak fordi du så med.", "Vielen Dank fürs Zuschauen!", "Merci d'avoir regardé!", "",
+                     "Thank you for watching this video.", "Thanks for watching and see you next time.",
+                     "Thanks for watching, bye bye.", "Like and subscribe.",
+                     "Vielen Dank fürs Zuschauen und bis zum nächsten Mal.", "Merci d'avoir regardé, à bientôt."):
+            self.assertTrue(st.is_hallucination(text), text)
+
+    def test_credit_lines_are_dropped_only_when_whisper_doubts_speech(self):
+        for text in ("Undertekster af Nordisk Film", "Tekster af: Mette", "Untertitel im Auftrag des ZDF, 2021",
+                     "Sous-titres réalisés par la communauté d'Amara.org"):
+            self.assertTrue(st.is_hallucination(text, no_speech_prob=0.5), text)
+            self.assertFalse(st.is_hallucination(text, no_speech_prob=0.05), text)
+
+    def test_real_dictation_is_kept(self):
+        # Dropping real speech is silent data loss: these all once vanished.
+        for text in ("Vi mødes hos Nordisk Film i morgen.", "Thank you for watching the shop yesterday.",
+                     "Thanks for watching the kids tonight.", "Please subscribe me to the newsletter.",
+                     "Underteksterne skal være klar fredag.", "Tekst fra Anna er modtaget.",
+                     "Untertitel bitte auf Deutsch.", "Sous-titres en français, merci.",
+                     "Captions by the agency arrived.", "Transcribed by the intern.",
+                     "Tak fordi du så med på mødet.", "Merci d'avoir regardé le dossier.",
+                     "Abonnez-vous à la newsletter.",
+                     "Please send the subtitles by Friday, we need them for the video.",
+                     "Vi skal have undertekster på videoen inden fredag og sende den til Anna i morgen.",
+                     "Can you watch the shop?"):
+            self.assertFalse(st.is_hallucination(text), text)
+
+    def test_short_signoff_dropped_only_when_whisper_doubts_speech(self):
+        self.assertFalse(st.is_hallucination("Thank you.", no_speech_prob=0.05))
+        self.assertTrue(st.is_hallucination("Thank you.", no_speech_prob=0.6))
+        self.assertTrue(st.is_hallucination("Tak.", no_speech_prob=0.5))
+
+
+def _seg(text, no_speech=0.01, logprob=-0.3, tokens=5):
+    from types import SimpleNamespace
+    return SimpleNamespace(text=text, no_speech_prob=no_speech, avg_logprob=logprob, tokens=[0] * tokens)
+
+
+class TestTranscribe(unittest.TestCase):
+    class FakeWhisper:
+        """Detects `detected`; returns the segments listed per language."""
+
+        def __init__(self, by_language, detected, speech_seconds=1.5):
+            self.by_language, self.detected, self.speech_seconds = by_language, detected, speech_seconds
+            self.calls = []
+
+        def transcribe(self, audio, language=None, **kwargs):
+            from types import SimpleNamespace
+            self.calls.append((language, kwargs))
+            lang = language or self.detected
+            info = SimpleNamespace(language=lang, language_probability=0.8 if language is None else 1.0,
+                                   duration_after_vad=self.speech_seconds,
+                                   all_language_probs=[(self.detected, 0.8), ("da", 0.05)])
+            return iter(self.by_language[lang]), info
+
+    def _app(self, whisper, config=None):
+        from types import SimpleNamespace
+        app = speak.SpeakApp.__new__(speak.SpeakApp)
+        app.config = {"last_language": "da"} if config is None else config
+        app.language = None
+        app.dictionary = SimpleNamespace(whisper_prompt=lambda: "Annika, SAP")
+        app.whisper_model = whisper
+        return app
+
+    def _run(self, app):
+        return app.transcribe(np.zeros(16000, dtype=np.float32))
+
+    def test_invented_segments_are_removed(self):
+        whisper = self.FakeWhisper({"da": [_seg(" Hej Anna."), _seg(" Undertekster af Nordisk Film", no_speech=0.6)]}, "da")
+        self.assertEqual(self._run(self._app(whisper)), ("Hej Anna.", "da", 0.8))
+        self.assertEqual(whisper.calls[0][1]["initial_prompt"], "Annika, SAP")
+        self.assertEqual(len(whisper.calls), 1)   # detection agreed with the last language: one pass
+
+    def test_only_invented_text_means_no_speech(self):
+        whisper = self.FakeWhisper({"en": [_seg(" Thank you.", no_speech=0.7)]}, "en")
+        self.assertEqual(self._run(self._app(whisper, {}))[0], "")
+
+    def test_short_phrase_keeps_last_language_when_whisper_is_more_sure_of_it(self):
+        # "Det er fint med mig" detected as German.
+        whisper = self.FakeWhisper({"de": [_seg(" Der fiegend mit mal.", logprob=-1.09)],
+                                    "da": [_seg(" Det er fint med mig.", logprob=-0.41)]}, "de")
+        self.assertEqual(self._run(self._app(whisper)), ("Det er fint med mig.", "da", 0.05))
+        # Detection pass, then both candidates greedily (no temperature fallback).
+        self.assertEqual([c[0] for c in whisper.calls], [None, "de", "da"])
+        self.assertNotIn("temperature", whisper.calls[0][1])
+        self.assertEqual([c[1].get("temperature") for c in whisper.calls[1:]], [0.0, 0.0])
+
+    def test_translation_into_the_last_language_does_not_win(self):
+        # Decoded in the wrong language Whisper translates fluently; a small
+        # log-probability edge is not enough to switch.
+        whisper = self.FakeWhisper({"de": [_seg(" Der fiegend mit mal.", logprob=-0.98)],
+                                    "en": [_seg(" That's fine with me.", logprob=-0.80)]}, "de")
+        self.assertEqual(self._run(self._app(whisper, {"last_language": "en"}))[:2], ("Der fiegend mit mal.", "de"))
+
+    def test_real_language_switch_is_kept(self):
+        whisper = self.FakeWhisper({"fr": [_seg(" Non, merci.", logprob=-0.21)],
+                                    "da": [_seg(" Nå, mærsk.", logprob=-0.9)]}, "fr")
+        self.assertEqual(self._run(self._app(whisper))[:2], ("Non, merci.", "fr"))
+
+    def test_long_dictation_is_not_decoded_twice(self):
+        whisper = self.FakeWhisper({"de": [_seg(" Lang.", logprob=-1.0)], "da": [_seg(" Lang.", logprob=-0.1)]},
+                                   "de", speech_seconds=8.0)
+        self.assertEqual(self._run(self._app(whisper))[1], "de")
+        self.assertEqual(len(whisper.calls), 1)
+
+    def test_check_can_be_turned_off_and_skips_locked_language(self):
+        segs = {"de": [_seg(" A.", logprob=-1.0)], "da": [_seg(" B.", logprob=-0.1)]}
+        whisper = self.FakeWhisper(segs, "de")
+        self._run(self._app(whisper, {"last_language": "da", "language_check_short_phrases": False}))
+        self.assertEqual(len(whisper.calls), 1)
+        whisper = self.FakeWhisper(segs, "de")
+        app = self._app(whisper)
+        app.language = "de"
+        self.assertEqual(self._run(app)[1], "de")
+        self.assertEqual(len(whisper.calls), 1)
+
+
+class TestCleanTextFastPath(unittest.TestCase):
+    def _app(self):
+        from types import SimpleNamespace
+        app = speak.SpeakApp.__new__(speak.SpeakApp)
+        app.config = {}
+        app.ai_mode, app.local_llm = "local", object()
+        app.dictionary = SimpleNamespace(prepare=lambda text, lang: (text, "", []),
+                                         apply_casing=lambda text: text, note_usage=lambda text: None)
+        app.llm_calls = []
+
+        def fake_format(text, lang, dict_hint="", quiet=False, instructions=None):
+            app.llm_calls.append(text)
+            return "LLM: " + text
+        app.format_text = fake_format
+        return app
+
+    def test_fast_path_and_stats(self):
+        app = self._app()
+        stats = {}
+        self.assertEqual(app.clean_text("um, yes that works", "en", verbose=False, stats=stats), "Yes that works.")
+        self.assertEqual(stats, {"llm": False})
+        self.assertEqual(app.clean_text("Um.", "en", verbose=False), "")
+        self.assertEqual(app.llm_calls, [])
+
+    def test_llm_gets_the_original_text(self):
+        app = self._app()
+        stats = {}
+        self.assertEqual(app.clean_text("Um, it was, like, huge", "en", verbose=False, stats=stats),
+                         "LLM: Um, it was, like, huge")
+        self.assertEqual(stats, {"llm": True})
+
+    def test_fast_path_can_be_turned_off(self):
+        app = self._app()
+        app.config = {"llm_fast_path": False}
+        app.clean_text("Nej tak.", "da", verbose=False)
+        self.assertEqual(app.llm_calls, ["Nej tak."])
+
+
+class TestClipboardRestore(unittest.TestCase):
+    """The restore after a paste runs on a timer and hands over cleanly when
+    Speak needs the clipboard again before it fires."""
+
+    class FakeUser32:
+        def __init__(self):
+            self.seq = 5
+
+        def GetClipboardSequenceNumber(self):
+            return self.seq
+
+    def setUp(self):
+        import threading
+        self.real_user32 = speak._user32
+        speak._user32 = self.fake = self.FakeUser32()
+        self.app = speak.SpeakApp.__new__(speak.SpeakApp)
+        self.app.clipboard_lock = threading.Lock()
+        self.app._pending_restore = self.app._pending_restore_timer = None
+        self.app.CLIPBOARD_RESTORE_DELAY = 0.05
+        self.restored = []
+        self.app._restore_clipboard = lambda token, delay=None: self.restored.append(token[0])
+        self.snapshot = {"kind": "text", "text": "the user's clipboard"}
+
+    def tearDown(self):
+        speak._user32 = self.real_user32
+
+    def _wait_for_timer(self, until=lambda: False, timeout=2.0):
+        """Waits for a timer to have had ample time to fire (or for until())."""
+        import time
+        deadline = time.time() + timeout
+        while time.time() < deadline and not until():
+            time.sleep(0.02)
+        time.sleep(0.1)
+
+    def test_restore_runs_later_without_blocking(self):
+        import time
+        self.app.CLIPBOARD_RESTORE_DELAY = 0.5
+        t0 = time.time()
+        with self.app.clipboard_lock:
+            self.app._schedule_clipboard_restore((self.snapshot, 5, time.time()))
+        self.assertLess(time.time() - t0, 0.3)   # far below the 0.5 s restore delay
+        self.assertEqual(self.restored, [])
+        self._wait_for_timer(until=lambda: self.restored)
+        self.assertEqual(self.restored, [self.snapshot])
+        self.assertIsNone(self.app._pending_restore)
+
+    def test_next_paste_inherits_the_users_clipboard(self):
+        import time
+        with self.app.clipboard_lock:
+            self.app._schedule_clipboard_restore((self.snapshot, 5, time.time()))
+            # A second dictation pastes before the restore: it must restore
+            # the user's text later, not the first dictation.
+            self.assertEqual(self.app._take_pending_restore(), self.snapshot)
+        self._wait_for_timer()
+        self.assertEqual(self.restored, [])   # the cancelled timer did nothing
+
+    def test_next_paste_waits_until_the_previous_one_had_its_time(self):
+        # The target app reads the clipboard when it handles Ctrl+V. Speak
+        # must not replace it sooner than CLIPBOARD_RESTORE_DELAY after a paste.
+        import time
+        self.app.CLIPBOARD_RESTORE_DELAY = 0.3
+        pasted_at = time.time()
+        # (The inner 0.2 s bound below is generous: the wait under test is 0.3 s.)
+        with self.app.clipboard_lock:
+            self.app._schedule_clipboard_restore((self.snapshot, 5, pasted_at))
+            self.app._take_pending_restore()
+            self.assertGreaterEqual(time.time() - pasted_at, 0.29)
+        # Once the delay has passed there is no wait at all.
+        with self.app.clipboard_lock:
+            self.app._schedule_clipboard_restore((self.snapshot, 5, time.time() - 1.0))
+            t0 = time.time()
+            self.app._take_pending_restore()
+            self.assertLess(time.time() - t0, 0.2)   # no 0.3 s wait
+
+    def test_user_copy_in_between_wins(self):
+        import time
+        with self.app.clipboard_lock:
+            self.app._schedule_clipboard_restore((self.snapshot, 5, time.time()))
+        self.fake.seq = 6   # the user copied something new
+        with self.app.clipboard_lock:
+            self.assertIsNone(self.app._take_pending_restore())
+
+    def test_flush_on_exit(self):
+        import time
+        with self.app.clipboard_lock:
+            self.app._schedule_clipboard_restore((self.snapshot, 5, time.time()))
+        self.app.flush_clipboard_restore()
+        self.assertEqual(self.restored, [self.snapshot])
+        self._wait_for_timer()
+        self.assertEqual(self.restored, [self.snapshot])   # not restored twice
+
+    def _prepare_win32_fakes(self):
+        """Stubs out keystrokes so insert_text / _learn_from_selection run headless."""
+        import types
+        self.real_send_keys = speak.send_keys
+        speak.send_keys = lambda steps: True
+        self.addCleanup(setattr, speak, "send_keys", self.real_send_keys)
+        self.app._release_modifiers = lambda timeout: True
+        self.app.play_sound = lambda kind: None
+        self.app.paste_mode = "auto"
+        self.app.get_foreground_info = lambda: ("notepad", "untitled", "notepad.exe")
+        self.app._clipboard_snapshot = lambda: {"kind": "text", "text": "fresh snapshot"}
+        self.app._open_clipboard = lambda attempts=5: False
+        self.app.dictionary = types.SimpleNamespace(learn_from_correction=lambda a, b: [])
+        self.typed = []
+        self.app.type_unicode_text = self.typed.append
+
+    def test_learn_with_nothing_selected_still_gives_the_clipboard_back(self):
+        import time
+        self._prepare_win32_fakes()
+        self.app.last_inserted_text = "dictation one"
+        with self.app.clipboard_lock:
+            self.app._schedule_clipboard_restore((self.snapshot, 5, time.time() - 1.0))
+            self.app._learn_from_selection()   # nothing selected: the copy never happens
+        self.assertEqual(self.restored, [self.snapshot])
+
+    def test_failed_clipboard_write_keeps_the_pending_restore(self):
+        import time
+        self._prepare_win32_fakes()
+        self.app._set_clipboard_text = lambda text: False
+        with self.app.clipboard_lock:
+            self.app._schedule_clipboard_restore((self.snapshot, 5, time.time() - 1.0))
+            token = self.app.insert_text("dictation two")
+        # Pasting would insert stale clipboard content: the text is typed instead.
+        self.assertEqual(self.typed, ["dictation two"])
+        self.assertIsNotNone(token)
+        self.assertEqual(token[0], self.snapshot)
+
+    def test_no_token_schedules_nothing(self):
+        with self.app.clipboard_lock:
+            self.app._schedule_clipboard_restore(None)
+        self.assertIsNone(self.app._pending_restore)
+
+
+class TestKeyInput(unittest.TestCase):
+    def test_chord_presses_then_releases_in_reverse(self):
+        self.assertEqual(speak.chord(speak.VK_CONTROL, speak.VK_V),
+                         [(speak.VK_CONTROL, False), (speak.VK_V, False), (speak.VK_V, True), (speak.VK_CONTROL, True)])
+
+    def test_key_inputs_carry_flags_and_scan_codes(self):
+        events = speak.build_key_inputs(speak.chord(speak.VK_SHIFT, speak.VK_INSERT))
+        self.assertEqual(len(events), 4)
+        self.assertTrue(all(e.type == speak.INPUT_KEYBOARD for e in events))
+        flags = [e.u.ki.dwFlags for e in events]
+        self.assertEqual(flags[0], 0)
+        self.assertEqual(flags[1], speak.KEYEVENTF_EXTENDEDKEY)                       # Insert is extended
+        self.assertEqual(flags[2], speak.KEYEVENTF_EXTENDEDKEY | speak.KEYEVENTF_KEYUP)
+        self.assertEqual(flags[3], speak.KEYEVENTF_KEYUP)
+        self.assertTrue(all(e.u.ki.wScan for e in events))                            # scan codes filled in
 
 
 if __name__ == "__main__":

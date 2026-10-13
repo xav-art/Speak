@@ -35,6 +35,8 @@ import wave
 
 import numpy as np
 
+import speak_text
+
 SAMPLE_RATE = 16000
 SHERPA_RELEASES = "https://github.com/k2-fsa/sherpa-onnx/releases/download"
 
@@ -285,18 +287,12 @@ def fix_split_sentences(turns, max_tail_words=4, max_gap=1.5):
     return [t for t in turns if t["text"]]
 
 
-# Disfluencies Whisper sometimes keeps. Only turns containing one of these (or
-# a stutter like "the the") go to Qwen: Whisper already leaves out most "um"s,
-# and on a clean turn the model can only reword it.
-DISFLUENCIES = {"um", "uh", "uhm", "umm", "hmm", "erm", "er", "øh", "øhm", "øhh", "äh", "ähm", "euh", "eh"}
-
-
-def needs_cleanup(text):
-    words = [_norm_word(w) for w in text.split()]
-    words = [w for w in words if w]
-    if any(w in DISFLUENCIES for w in words):
-        return True
-    return any(a == b for a, b in zip(words, words[1:]))
+def needs_cleanup(text, lang=None):
+    """Only turns with a filler sound or a stutter ("the the") go to Qwen:
+    Whisper already leaves out most "um"s, and on a clean turn the model can
+    only reword it. The language matters: "er" is a filler in English but
+    means "is" in Danish, which once sent nearly every Danish turn to Qwen."""
+    return speak_text.has_disfluency(text, lang)
 
 
 def chunk_lines(lines, count_tokens, budget):
@@ -1202,6 +1198,10 @@ class MeetingManager:
                 vad_parameters=dict(min_silence_duration_ms=500),
                 word_timestamps=True, condition_on_previous_text=False, initial_prompt=prompt)
             for seg in segments:
+                if speak_text.is_hallucination(seg.text, seg.no_speech_prob):
+                    if seg.text.strip():
+                        self.log(f"\n[Meeting] Ignored \"{seg.text.strip()}\" (Whisper invents this on silence).")
+                    continue
                 for w in seg.words or []:
                     start = track_to_meeting_time(w.start, pieces)
                     end = track_to_meeting_time(w.end, pieces, is_start=False)
@@ -1336,7 +1336,7 @@ class MeetingManager:
         t0 = time.time()
         ai_on = self.app.ai_mode != "off" and self.app.local_llm is not None
         clean = ai_on and self.config.get("meeting_cleanup", True)
-        todo = {id(t) for t in turns if clean and needs_cleanup(t["text"])}
+        todo = {id(t) for t in turns if clean and needs_cleanup(t["text"], t["lang"])}
         rejected = done = 0
         for t in turns:
             text = self.app.clean_text(t["text"], t["lang"], use_llm=False, verbose=False)
@@ -1354,7 +1354,7 @@ class MeetingManager:
                     text = cleaned
                 else:
                     rejected += 1   # the model reworded it: keep what was said
-            t["text"] = self.app._light_cleanup(text)
+            t["text"] = speak_text.light_cleanup(text)
         if todo:
             print(flush=True)
             self.log(f"[Meeting] AI cleanup: {len(todo) - rejected} of {len(turns)} turns had fillers or stutters "

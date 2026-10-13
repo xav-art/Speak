@@ -45,6 +45,7 @@ import win32clipboard
 # Dynamic directory paths (portable across any user account or path)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, BASE_DIR)
+import speak_text
 from speak_dictionary import Dictionary
 from speak_meeting import MeetingManager
 CONFIG_PATH = os.path.join(BASE_DIR, "speak_config.json")
@@ -150,6 +151,47 @@ class INPUT_UNION(ctypes.Union):
 
 class INPUT(ctypes.Structure):
     _fields_ = [("type", wintypes.DWORD), ("u", INPUT_UNION)]
+
+_user32.SendInput.argtypes = [wintypes.UINT, ctypes.POINTER(INPUT), ctypes.c_int]
+_user32.SendInput.restype = wintypes.UINT
+_user32.MapVirtualKeyW.argtypes = [wintypes.UINT, wintypes.UINT]
+_user32.MapVirtualKeyW.restype = wintypes.UINT
+_user32.GetAsyncKeyState.argtypes = [ctypes.c_int]
+_user32.GetAsyncKeyState.restype = ctypes.c_short
+
+KEYEVENTF_EXTENDEDKEY = 0x0001
+VK_C = 0x43
+VK_LWIN = 0x5B
+VK_RWIN = 0x5C
+# Keys on the extended part of the keyboard. Without the flag, Insert can
+# arrive as the numeric keypad's 0/Ins key.
+EXTENDED_KEYS = {VK_INSERT, 0x2E, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28}
+
+
+def build_key_inputs(steps):
+    """[(virtual key, is_key_up)] -> INPUT array for a single SendInput call.
+    Scan codes are filled in because some apps (remote desktops, Citrix)
+    read those instead of the virtual key."""
+    events = (INPUT * len(steps))()
+    for event, (vk, key_up) in zip(events, steps):
+        flags = (KEYEVENTF_KEYUP if key_up else 0) | (KEYEVENTF_EXTENDEDKEY if vk in EXTENDED_KEYS else 0)
+        event.type = INPUT_KEYBOARD
+        event.u.ki = KEYBDINPUT(vk, _user32.MapVirtualKeyW(vk, 0) & 0xFF, flags, 0, 0)
+    return events
+
+
+def send_keys(steps):
+    """Sends a key sequence in one SendInput call, so the user's own key
+    presses cannot land in the middle of it. Returns False when Windows did
+    not accept it (a locked screen, for example). Input blocked by UIPI (the
+    target app runs as administrator) is NOT reported: Windows hides it."""
+    events = build_key_inputs(steps)
+    return _user32.SendInput(len(events), events, ctypes.sizeof(INPUT)) == len(events)
+
+
+def chord(*vks):
+    """Press keys in order, release in reverse: chord(VK_CONTROL, VK_V) is Ctrl+V."""
+    return [(vk, False) for vk in vks] + [(vk, True) for vk in reversed(vks)]
 
 FUNCTION_KEYS = {
     "F1": 0x70, "F2": 0x71, "F3": 0x72, "F4": 0x73,
@@ -276,6 +318,7 @@ def load_config(path=None):
         "llm_threads": 6,
         "speculative_decoding": False,
         "llm_fast_path": True,
+        "language_check_short_phrases": True,
         "warm_up": True,
         "high_priority": True,
         "meeting_hotkey": "CTRL+ALT+M",
@@ -446,6 +489,10 @@ class SpeakApp:
         self.worker_thread = None
         # Serializes clipboard borrowing (paste + restore vs. learn hotkey copy).
         self.clipboard_lock = threading.Lock()
+        # The clipboard restore that runs shortly after a paste (see
+        # _schedule_clipboard_restore). Guarded by clipboard_lock.
+        self._pending_restore = None
+        self._pending_restore_timer = None
 
         # Personal dictionary + auto-learning from corrections
         self.dictionary = Dictionary(BASE_DIR)
@@ -485,8 +532,7 @@ class SpeakApp:
             try:
                 if audio_data is None:   # shutdown sentinel
                     return
-                with self.engine_lock:
-                    self._process_worker(audio_data)
+                self._process_worker(audio_data)
             except Exception as e:
                 log(f"[Error] Worker failure: {e}")
             finally:
@@ -687,6 +733,17 @@ class SpeakApp:
             log(f"[TRANSCRIBING] Processing {duration:.1f}s of speech using faster-whisper-{self.model_size}...")
         self.jobs.put(audio_data)
 
+    # Language detection is unreliable on a phrase of a few seconds: "Det er
+    # fint med mig" scores German 0.92, Danish 0.03 on Whisper base, yet is
+    # transcribed perfectly once Danish is set. Up to this much speech, a
+    # detection that disagrees with the user's last language is checked by
+    # decoding in both. The last language must win by a margin: decoded in the
+    # wrong language Whisper translates ("Non, merci" -> "No, thank you."),
+    # and in the benchmark a translation scored at most 0.08 better than the
+    # detected language, against 0.29 and more for real corrections.
+    LANGUAGE_CHECK_MAX_SPEECH = 4.0
+    LANGUAGE_CHECK_MARGIN = 0.25
+
     def transcribe(self, audio_data):
         """Whisper speech-to-text for one dictation. The caller holds engine_lock.
         Returns (text, language, language probability); text is "" when no
@@ -695,10 +752,37 @@ class SpeakApp:
         # window; the detect_language patch restricts it to the 4 supported
         # languages and the encoder cache makes detection nearly free.
         target_lang = self.language if self.language in ALLOWED_LANGUAGES else None
+        last = self.config.get("last_language")
+        last = last if last in ALLOWED_LANGUAGES else None
+        text, info, _ = self._decode(audio_data, target_lang)
+        lang = info.language if info.language in ALLOWED_LANGUAGES else "en"
+        prob = info.language_probability if self.language is None else 1.0
+
+        if (target_lang is None and last and lang != last and text
+                and self.config.get("language_check_short_phrases", True)
+                and getattr(info, "duration_after_vad", 0.0) <= self.LANGUAGE_CHECK_MAX_SPEECH):
+            # Both candidates are decoded greedily so their scores compare like
+            # for like. Whisper's temperature fallback would re-decode up to 5
+            # times in the wrong language (seen: 0.5 s -> 3.5 s), and the
+            # encoder output is cached, so these two passes are decoder only.
+            _, _, det_logprob = self._decode(audio_data, lang, fallback=False)
+            alt_text, _, alt_logprob = self._decode(audio_data, last, fallback=False)
+            if alt_text and alt_logprob > det_logprob + self.LANGUAGE_CHECK_MARGIN:
+                log(f"[Language] Short phrase: {ALLOWED_LANGUAGES[last]} fits better than "
+                    f"{ALLOWED_LANGUAGES[lang]} (\"{text}\" -> \"{alt_text}\").")
+                text, lang = alt_text, last
+                prob = dict(getattr(info, "all_language_probs", None) or []).get(last, 0.0)
+        return text, lang, prob
+
+    def _decode(self, audio_data, language, fallback=True):
+        """One Whisper pass. Returns (text, info, average token log-probability).
+        fallback=False decodes greedily only (no temperature fallback)."""
+        extra = {} if fallback else {"temperature": 0.0}
         segments, info = self.whisper_model.transcribe(
             audio_data,
             beam_size=1,
-            language=target_lang,
+            language=language,
+            **extra,
             vad_filter=True,
             vad_parameters=dict(min_silence_duration_ms=400),
             without_timestamps=True,
@@ -708,32 +792,45 @@ class SpeakApp:
             # multi-word names: "Salesforce Force".)
             initial_prompt=self.dictionary.whisper_prompt()
         )
-        raw_text = " ".join([seg.text for seg in segments]).strip()
-        lang = info.language if info.language in ALLOWED_LANGUAGES else "en"
-        prob = info.language_probability if self.language is None else 1.0
-        return raw_text, lang, prob
+        kept, weighted, tokens = [], 0.0, 0
+        for seg in segments:
+            if speak_text.is_hallucination(seg.text, seg.no_speech_prob):
+                if seg.text.strip():
+                    log(f"[Whisper] Ignored \"{seg.text.strip()}\" (Whisper invents this on silence or noise).")
+                continue
+            kept.append(seg.text)
+            n = max(1, len(getattr(seg, "tokens", None) or []))
+            weighted += getattr(seg, "avg_logprob", 0.0) * n
+            tokens += n
+        return " ".join(kept).strip(), info, (weighted / tokens if tokens else float("-inf"))
 
     def _process_worker(self, audio_data):
         t0 = time.time()
         try:
-            # 1. Local Whisper Speech-to-Text
-            raw_text, target_lang, lang_prob = self.transcribe(audio_data)
-            t_whisper = time.time() - t0
+            # Steps 1 and 2 use the shared engines. Insertion does not, so a
+            # meeting being cleaned up does not wait for the paste.
+            with self.engine_lock:
+                # 1. Local Whisper Speech-to-Text
+                raw_text, target_lang, lang_prob = self.transcribe(audio_data)
+                t_whisper = time.time() - t0
 
-            if not raw_text:
-                log("[Info] No speech detected.")
-                return
+                if not raw_text:
+                    log("[Info] No speech detected.")
+                    return
 
-            self.last_language = target_lang
-            if self.config.get("last_language") != target_lang:
-                self.config["last_language"] = target_lang
-                save_config(self.config)
+                self.last_language = target_lang
+                if self.config.get("last_language") != target_lang:
+                    self.config["last_language"] = target_lang
+                    save_config(self.config)
 
-            lang_name = ALLOWED_LANGUAGES.get(target_lang, target_lang.upper())
-            log(f"[Whisper STT {t_whisper:.2f}s] [{lang_name} ({target_lang}) - {lang_prob*100:.0f}% confidence]: \"{raw_text}\"")
+                lang_name = ALLOWED_LANGUAGES.get(target_lang, target_lang.upper())
+                log(f"[Whisper STT {t_whisper:.2f}s] [{lang_name} ({target_lang}) - {lang_prob*100:.0f}% confidence]: \"{raw_text}\"")
 
-            # 2. Dictionary + Local AI Formatting & Cleanup
-            final_text = self.clean_text(raw_text, target_lang)
+                # 2. Dictionary + Local AI Formatting & Cleanup
+                final_text = self.clean_text(raw_text, target_lang)
+                if not final_text:
+                    log("[Info] Only filler words were heard. Nothing to insert.")
+                    return
 
             # 3. Universal text insertion into active window
             with self.clipboard_lock:
@@ -743,8 +840,9 @@ class SpeakApp:
                 threading.Thread(target=self.play_sound, args=("success",), daemon=True).start()
                 log(f"[DONE] Inserted in {elapsed:.2f}s! [Ready for next dictation] "
                     f"(Fix a word? Select the sentence and tap {self.learn_hotkey_req} to teach Speak.)\n")
-                # Put the user's own clipboard back once the target app has pasted.
-                self._restore_clipboard(restore_token)
+                # Put the user's own clipboard back once the target app has
+                # pasted, without holding up the next dictation meanwhile.
+                self._schedule_clipboard_restore(restore_token)
 
         except Exception as e:
             log(f"[Error] Transcription failed: {e}")
@@ -768,8 +866,10 @@ class SpeakApp:
                 log(f"[Dictionary] '{heard}' -> '{word}' (learned correction)")
 
         if use_llm and self.ai_mode != "off" and self.local_llm:
-            if self.config.get("llm_fast_path", True) and not dict_hint and not self._needs_llm(text):
-                text = self._light_cleanup(text)
+            # "Um, yes." is a short clean phrase once the leading filler is gone.
+            stripped = speak_text.strip_leading_fillers(text)
+            if self.config.get("llm_fast_path", True) and not dict_hint and not speak_text.needs_llm(stripped, lang):
+                text = speak_text.light_cleanup(stripped) if stripped else ""
                 if verbose:
                     log(f"[Fast path] Short clean phrase, LLM skipped: \"{text}\"")
             else:
@@ -785,40 +885,6 @@ class SpeakApp:
         text = self.dictionary.apply_casing(text)
         if verbose:
             self.dictionary.note_usage(text)
-        return text
-
-    # Words that mean the LLM has real work to do. Anything short without one of
-    # these ("yes that sounds good", "tak for i dag") is inserted straight away.
-    FILLER_OR_COMMAND = {
-        "um", "uh", "uhm", "umm", "hmm", "erm", "er", "ah", "like", "actually", "basically",
-        "øh", "øhm", "altså", "sådan", "hvad hedder det", "ikk", "ikke også",
-        "äh", "ähm", "also", "quasi", "sozusagen", "halt",
-        "euh", "ben", "bah", "genre", "en fait", "du coup",
-        "bullet", "point", "new", "line", "paragraph", "punkt", "punktum", "linje", "linjeskift",
-        "komma", "comma", "period", "aufzählungspunkt", "zeile", "absatz", "puce", "ligne",
-        "scratch", "wait", "no", "nej", "nein", "non", "mean", "correction",
-    }
-    FAST_PATH_MAX_WORDS = 8
-
-    def _needs_llm(self, text):
-        words = text.lower().split()
-        if len(words) > self.FAST_PATH_MAX_WORDS:
-            return True
-        stripped = [w.strip(".,;:!?\"'()") for w in words]
-        if any(w in self.FILLER_OR_COMMAND for w in stripped):
-            return True
-        if any(a == b for a, b in zip(stripped, stripped[1:])):   # stutter: "the the"
-            return True
-        if any(ch.isdigit() for ch in text):                        # numbers/dates need formatting
-            return True
-        return False
-
-    def _light_cleanup(self, text):
-        text = " ".join(text.split())
-        if text and text[0].islower():
-            text = text[0].upper() + text[1:]
-        if text and text[-1] not in ".!?:":
-            text += "."
         return text
 
     def format_text(self, text, lang, dict_hint="", quiet=False, instructions=None):
@@ -1089,13 +1155,87 @@ You are an intelligent voice dictation assistant. Clean up this spoken transcrip
             return  # the user (or another app) copied something new - keep it
         self._set_clipboard_text(snapshot.get("text") if snapshot["kind"] == "text" else None)
 
+    def _schedule_clipboard_restore(self, token):
+        """Restores the user's clipboard CLIPBOARD_RESTORE_DELAY after a paste,
+        on a timer thread. Waiting here instead held the transcription worker
+        and the clipboard for 0.8 s after every dictation, which delayed the
+        next queued dictation and the learn hotkey. Call with clipboard_lock held."""
+        if not token:
+            return
+        delay = max(0.0, self.CLIPBOARD_RESTORE_DELAY - (time.time() - token[2]))
+        timer = threading.Timer(delay, self._run_scheduled_restore, args=(token,))
+        timer.daemon = True
+        self._pending_restore, self._pending_restore_timer = token, timer
+        timer.start()
+
+    def _run_scheduled_restore(self, token):
+        with self.clipboard_lock:
+            if self._pending_restore is not token:
+                return   # taken over by a newer paste or the learn hotkey
+            self._pending_restore = self._pending_restore_timer = None
+            self._restore_clipboard(token, delay=0)
+
+    def _take_pending_restore(self):
+        """Cancels a scheduled restore before Speak uses the clipboard again.
+        Returns the user's saved clipboard while Speak's pasted text is still
+        on it, so the next restore puts back the user's content and not the
+        previous dictation. Returns None when nothing is pending or the user
+        has copied something since (that is then the clipboard to keep).
+        Call with clipboard_lock held."""
+        token, timer = self._pending_restore, self._pending_restore_timer
+        if not token:
+            return None
+        # An app reads the clipboard only when it handles the Ctrl+V, which can
+        # take a moment when it is busy. Replacing the clipboard before then
+        # made it paste the next dictation twice (seen end to end). So the
+        # previous paste still gets its full CLIPBOARD_RESTORE_DELAY; the time
+        # the next dictation spent in Whisper and Qwen already counts.
+        wait = self.CLIPBOARD_RESTORE_DELAY - (time.time() - token[2])
+        if wait > 0:
+            time.sleep(wait)
+        self._pending_restore = self._pending_restore_timer = None
+        if timer:
+            timer.cancel()
+        snapshot, our_seq, _ = token
+        return snapshot if _user32.GetClipboardSequenceNumber() == our_seq else None
+
+    def flush_clipboard_restore(self):
+        """Restores a pending clipboard now (on exit, so it is not lost)."""
+        with self.clipboard_lock:
+            token, timer = self._pending_restore, self._pending_restore_timer
+            self._pending_restore = self._pending_restore_timer = None
+            if timer:
+                timer.cancel()
+            if token:
+                self._restore_clipboard(token, delay=0)
+
+    MODIFIER_KEYS = (VK_SHIFT, VK_CONTROL, VK_MENU)
+
+    def _release_modifiers(self, timeout):
+        """Waits until the user has let go of Shift, Ctrl, Alt and Win, which
+        are often still down from the hotkey: a Ctrl+C sent while Alt is
+        physically held reaches the app as Ctrl+Alt+C. If a key is still down
+        after timeout, a key-up is sent for Shift/Ctrl/Alt (never Win: a lone
+        Win key-up opens the Start menu). Returns True if all were released."""
+        deadline = time.time() + timeout
+        while True:
+            held = [vk for vk in self.MODIFIER_KEYS + (VK_LWIN, VK_RWIN) if _user32.GetAsyncKeyState(vk) & 0x8000]
+            if not held:
+                return True
+            if time.time() >= deadline:
+                break
+            time.sleep(0.01)
+        release = [(vk, True) for vk in held if vk in self.MODIFIER_KEYS]
+        if release:
+            send_keys(release)
+            time.sleep(0.03)
+        return False
+
     def insert_text(self, text):
         """Inserts text into the focused app. Returns a clipboard restore token
-        (pass to _restore_clipboard) or None when the clipboard was not used."""
-        ctypes.windll.user32.keybd_event(VK_SHIFT, 0, KEYEVENTF_KEYUP, 0)
-        ctypes.windll.user32.keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0)
-        ctypes.windll.user32.keybd_event(VK_MENU, 0, KEYEVENTF_KEYUP, 0)
-        time.sleep(0.05)
+        (pass to _schedule_clipboard_restore) or None when the clipboard was not
+        used. Call with clipboard_lock held."""
+        self._release_modifiers(timeout=0.3)
 
         cls, title, exe = self.get_foreground_info()
         terminal_exes = {
@@ -1114,28 +1254,33 @@ You are an intelligent voice dictation assistant. Clean up this spoken transcrip
             self.type_unicode_text(text)
             return None
 
-        snapshot = self._clipboard_snapshot()
+        inherited = self._take_pending_restore()
+        snapshot = inherited or self._clipboard_snapshot()
         if not self._set_clipboard_text(text):
-            log("[Insert Warning] Could not write to the clipboard (held by another app); pasting anyway.")
-            snapshot = None
+            # Pasting now would insert whatever is on the clipboard (the user's
+            # content or the previous dictation). Type the text instead.
+            log("[Insert Warning] Could not write to the clipboard (held by another app); typing the text instead.")
+            self.type_unicode_text(text)
+            if inherited is None:
+                return None   # the clipboard still holds the user's own content
+            # A previous dictation is still on the clipboard: keep its restore.
+            return (snapshot, _user32.GetClipboardSequenceNumber(), time.time())
         our_seq = _user32.GetClipboardSequenceNumber()
 
         time.sleep(0.05)
 
         if is_terminal and "consolewindowclass" in cls:
             log("[Insert] Using Shift+Insert for classic console...")
-            ctypes.windll.user32.keybd_event(VK_SHIFT, 0, 0, 0)
-            ctypes.windll.user32.keybd_event(VK_INSERT, 0, 0, 0)
-            time.sleep(0.03)
-            ctypes.windll.user32.keybd_event(VK_INSERT, 0, KEYEVENTF_KEYUP, 0)
-            ctypes.windll.user32.keybd_event(VK_SHIFT, 0, KEYEVENTF_KEYUP, 0)
+            sent = send_keys(chord(VK_SHIFT, VK_INSERT))
         else:
             log(f"[Insert] Using Clipboard Paste (Target: '{cls or title}')...")
-            ctypes.windll.user32.keybd_event(VK_CONTROL, 0, 0, 0)
-            ctypes.windll.user32.keybd_event(VK_V, 0, 0, 0)
-            time.sleep(0.03)
-            ctypes.windll.user32.keybd_event(VK_V, 0, KEYEVENTF_KEYUP, 0)
-            ctypes.windll.user32.keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0)
+            sent = send_keys(chord(VK_CONTROL, VK_V))
+        if not sent:
+            log("[Insert Warning] Windows did not accept the paste keystroke (for example, the screen is "
+                "locked). The text is on the clipboard: press Ctrl+V to paste it.")
+            # Deliberate: the dictation stays on the clipboard so the user can
+            # paste it by hand. Their earlier clipboard content is not restored.
+            return None
         return (snapshot, our_seq, time.time()) if snapshot else None
 
     LEARN_HOTKEY_ID = 9
@@ -1176,16 +1321,13 @@ You are an intelligent voice dictation assistant. Clean up this spoken transcrip
             threading.Thread(target=self.play_sound, args=("error",), daemon=True).start()
             return
 
-        for vk in (VK_SHIFT, VK_CONTROL, VK_MENU):
-            ctypes.windll.user32.keybd_event(vk, 0, KEYEVENTF_KEYUP, 0)
-        time.sleep(0.05)
-        snapshot = self._clipboard_snapshot()
+        # The user may still be holding Ctrl+Alt from the hotkey: wait for the
+        # release, or the app receives Ctrl+Alt+C instead of Ctrl+C.
+        self._release_modifiers(timeout=0.6)
+        inherited = self._take_pending_restore()
+        snapshot = inherited or self._clipboard_snapshot()
         seq_before = _user32.GetClipboardSequenceNumber()
-        ctypes.windll.user32.keybd_event(VK_CONTROL, 0, 0, 0)
-        ctypes.windll.user32.keybd_event(0x43, 0, 0, 0)  # 'C'
-        time.sleep(0.03)
-        ctypes.windll.user32.keybd_event(0x43, 0, KEYEVENTF_KEYUP, 0)
-        ctypes.windll.user32.keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0)
+        send_keys(chord(VK_CONTROL, VK_C))
 
         # Wait for the app to actually copy (sequence number changes). Without
         # this, an empty selection made Speak diff stale clipboard contents.
@@ -1209,7 +1351,9 @@ You are an intelligent voice dictation assistant. Clean up this spoken transcrip
                         win32clipboard.CloseClipboard()
                     except Exception:
                         pass
-            # The selection was only borrowed - give the user their clipboard back.
+        if copied or inherited is not None:
+            # The selection was only borrowed, or a dictation was still on the
+            # clipboard waiting for its restore: give the user their clipboard back.
             self._restore_clipboard((snapshot, _user32.GetClipboardSequenceNumber(), time.time()), delay=0)
 
         if not corrected or not corrected.strip():
@@ -1324,7 +1468,8 @@ You are an intelligent voice dictation assistant. Clean up this spoken transcrip
                 self.unregister_hotkeys()
                 self.register_hotkeys()
 
-            if ctypes.windll.user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, PM_REMOVE):
+            # Handle every queued message, not one per 20 ms.
+            while ctypes.windll.user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, PM_REMOVE):
                 if msg.message == WM_HOTKEY:
                     if msg.wParam == self.LEARN_HOTKEY_ID:
                         threading.Thread(target=self.learn_from_selection, daemon=True).start()
@@ -1624,6 +1769,7 @@ You are an intelligent voice dictation assistant. Clean up this spoken transcrip
             self.running = False
             self.meetings.shutdown()
             self.unregister_hotkeys()
+            self.flush_clipboard_restore()
             try:
                 self.jobs.put(None)
             except Exception:

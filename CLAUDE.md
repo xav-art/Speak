@@ -1,0 +1,53 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## What this is
+
+Speak is an offline voice dictation app for Windows, written in Python 3.12 and run as a console app. Tap a hotkey, speak, and faster-whisper transcribes the audio. Qwen 2.5 (a GGUF model run by llama-cpp-python) cleans up the text, which is then pasted or typed into the focused window. Meeting mode records the mic and WASAPI loopback, diarizes the speakers with sherpa-onnx, and writes a Markdown transcript with minutes. Two constraints shape every change: no network calls at runtime (only one-time model downloads, each checked against a SHA-256), and no admin rights (Windows user space only).
+
+## Commands
+
+```powershell
+# Run the app (uses .venv\Scripts\python.exe if setup created one, otherwise global python)
+.\start_speak.bat                 # or: python -X utf8 speak.py [--hotkey F8 --model small --language da --ai-mode off]
+
+# Tests (stdlib unittest; no pytest)
+python -m unittest test_speak.py
+python -m unittest test_speak.TestMeetingHelpers                       # one class
+python -m unittest test_speak.TestMeetingHelpers.test_format_timestamp # one test
+
+# Benchmark: real pipeline on synthetic clips, nothing typed, user config untouched (see README "Benchmark")
+python -X utf8 bench/run_bench.py --label <name> --repeat 3 [--scenario same|other|none] [--set model=small]
+python -X utf8 bench/run_bench.py --compare bench/results/A.json bench/results/B.json
+
+# Headless entry points
+python -X utf8 speak.py --download-models                 # fetch models for the current config, then exit
+python -X utf8 speak.py --transcribe-meeting <file|recording-folder>  # runs alongside a live Speak window
+```
+
+There is no build step and no linter config. `install.ps1` is the installer, updater and uninstaller: it creates `.venv`, installs llama-cpp-python from a prebuilt CPU wheel index (`--no-deps --only-binary`), because PyPI only has the source, and the rest from `requirements.txt`. In this dev checkout there is no `.venv`, so the launchers fall back to global `python`.
+
+## Architecture
+
+Four modules, with `speak.py` as the hub:
+
+- **`speak.py` / `SpeakApp`**: owns the config (`load_config`/`save_config`: an atomic write through `.tmp`, and a corrupt file is renamed to `.corrupt-*`), the Win32 hotkey listener thread (`RegisterHotKey` + `PeekMessageW` loop), and audio capture. One **worker thread** consumes the `self.jobs` queue in order, with `_process_worker`: `transcribe` (Whisper), then `clean_text` (dictionary, then the fast path or Qwen), then `insert_text` (clipboard paste or `SendInput` typing, chosen by `paste_mode`). After a paste the user's clipboard is restored on a timer (`_schedule_clipboard_restore`); anything that uses the clipboard again first calls `_take_pending_restore`. `_split_for_llm` chunks long dictations at sentence boundaries. A Win32 mutex makes it single-instance, except in `--transcribe-meeting` mode.
+- **`speak_text.py`**: pure text rules shared by dictation and meetings, all unit tested: the fast path (`strip_leading_fillers`, `needs_llm`), meeting disfluency check (`has_disfluency`), the filter for text Whisper invents on silence (`is_hallucination`). Filler lists are per language on purpose: "er" is a filler in English but "is" in Danish.
+- **`speak_dictionary.py` / `Dictionary`**: personal vocabulary in `speak_dictionary.json`. It supplies the Whisper `initial_prompt` (`whisper_prompt()`), mishearing corrections and casing enforcement. `extract_corrections` diffs the original and corrected text for the Ctrl+Alt+L "learn from selection" flow. It rejects rewrites (>50% of words changed), common words and words under 3 letters.
+- **`speak_meeting.py`**: pure helper functions at module level (diarization post-processing, turn building, echo removal, `split_clauses`/`render_minutes` for action items). Most tests target these. It also holds `MeetingRecorder` (mic + loopback streamed to WAVs under `recordings/`) and `MeetingManager`, which has its own background worker queue. `MeetingManager` receives the `SpeakApp` instance and reuses it: `app._load_whisper`, `app.clean_text`, `app.load_llm`, `app.dictionary`, `app.play_sound`.
+
+**Concurrency rule:** `app.engine_lock` serializes all use of the shared Whisper/LLM engines. The dictation worker holds it per job, and meeting cleanup takes it per turn, so dictation keeps working while a meeting is processed. Model switches from the menu also wait on it. Any new code that touches `app.local_llm` or the Whisper model must take this lock.
+
+**Meeting minutes design:** the code finds the clauses (multilingual promise/request/agreement cues), and Qwen only rephrases one clause at a time into JSON (few-shot, no grammar constraint). The **owner comes from the transcript, not the LLM** (who promised, or who agreed to a request). Items are grounded on word stems in their source clause. Cleanup of meeting turns is rejected by `faithful()` if Qwen changed more than about 10% of the words.
+
+## Conventions and gotchas
+
+- Whisper's language detection is unreliable on phrases of a few seconds. For up to 4 s of speech that Whisper detects as another language than the user's last one, `transcribe` decodes both candidates greedily (`_decode(..., fallback=False)`; the temperature fallback made a wrong-language pass take seconds) and switches to the last language only if its average log-probability is higher by `LANGUAGE_CHECK_MARGIN`: decoded in the wrong language, Whisper translates fluently ("Non, merci" -> "No, thank you.") and scores almost as well. Validate language changes with `bench/run_bench.py --scenario other` as well as `same`.
+- Run Python with `-X utf8` (all launchers do). Output includes Danish, German and French text.
+- Personal and generated files are gitignored and must never be committed: `speak_config.json`, `speak_dictionary.json`, `speak_voice.json` (voice embedding), `models/`, `recordings/`, `.venv/`. `install.ps1` preserves them on update. Add any new per-user file to both `.gitignore` and the `install.ps1` exclude/keep lists.
+- New config keys: add a default in `load_config` and document the key in the README Configuration table.
+- Meeting transcripts default to the local `%USERPROFILE%\Documents\Speak Meetings`, never the OneDrive-redirected known folder. This is deliberate, for privacy.
+- `speak`, `speak.bat`, `speak.cmd` and `start_speak.bat` are near-duplicate launchers. Keep them in sync. `install_dependencies.bat` is a legacy alias for `setup.cmd`.
+- The README's "Performance notes" list optimizations that were measured and rejected (speculative decoding, flash attention, Whisper `hotwords`, more Whisper threads on hybrid CPUs). Do not reintroduce them as defaults.
+- Pushing to `xav-art/Speak`: Git Credential Manager may sign in as a work account and get a 403. Push with `git -c credential.helper= -c "credential.helper=!gh auth git-credential" push`. Do not run `gh auth setup-git`.

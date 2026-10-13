@@ -33,6 +33,7 @@ import json
 import os
 import platform
 import re
+import shutil
 import statistics
 import subprocess
 import sys
@@ -44,6 +45,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 RESULTS_DIR = os.path.join(HERE, "results")
 LANGS = ("en", "da", "de", "fr")
+SEED = 1234
 
 # Fillers ignored when scoring raw Whisper output: whether Whisper writes
 # them down is not an error, removing them is the cleanup's job.
@@ -85,7 +87,9 @@ def git_revision():
     try:
         rev = subprocess.run(["git", "-C", ROOT, "rev-parse", "--short", "HEAD"],
                              capture_output=True, text=True, check=True).stdout.strip()
-        dirty = subprocess.run(["git", "-C", ROOT, "status", "--porcelain", "--untracked-files=no"],
+        # Untracked files count too: a new module that is not committed yet
+        # changes what is being measured.
+        dirty = subprocess.run(["git", "-C", ROOT, "status", "--porcelain"],
                                capture_output=True, text=True, check=True).stdout.strip()
         return rev + ("+dirty" if dirty else "")
     except Exception:
@@ -113,6 +117,7 @@ def parse_overrides(pairs):
 
 def run(args):
     sys.path.insert(0, ROOT)
+    import ctranslate2
     import speak
     import speak_meeting
     from speak_dictionary import Dictionary
@@ -140,6 +145,14 @@ def run(args):
         timings = []
         for _ in range(args.repeat):
             app.config["last_language"] = last_language_for(clip["lang"], args.scenario)
+            # Whisper samples when greedy decoding looks wrong (temperature
+            # fallback) and Qwen samples at temperature 0.1. Fixed seeds per
+            # clip make most results repeatable. Not all: CTranslate2 samples
+            # on its own worker thread, which this seed does not reach, so a
+            # clip that needs Whisper's fallback can change between runs.
+            ctranslate2.set_random_seed(SEED)
+            if app.local_llm:
+                app.local_llm.set_seed(SEED)
             with app.engine_lock:
                 t0 = time.perf_counter()
                 raw, lang, prob = app.transcribe(audio)
@@ -171,7 +184,7 @@ def run(args):
         "revision": git_revision(), "scenario": args.scenario, "repeat": args.repeat,
         "machine": platform.processor() or platform.machine(), "load_s": round(load_seconds, 2),
         "config": {k: cfg.get(k) for k in ("model", "local_model", "ai_mode", "whisper_threads", "llm_threads",
-                                           "llm_fast_path", "language")},
+                                           "llm_fast_path", "language", "language_check_short_phrases")},
         "overrides": parse_overrides(args.set),
         "summary": summarize(rows), "clips": rows,
     }
@@ -182,6 +195,7 @@ def run(args):
     with open(path, "w", encoding="utf-8") as f:
         json.dump(result, f, indent=2, ensure_ascii=False)
     print(f"\nSaved: {os.path.abspath(path)}")
+    shutil.rmtree(tmp, ignore_errors=True)
 
 
 def summarize(rows):
