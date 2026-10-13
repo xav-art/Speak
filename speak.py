@@ -687,38 +687,43 @@ class SpeakApp:
             log(f"[TRANSCRIBING] Processing {duration:.1f}s of speech using faster-whisper-{self.model_size}...")
         self.jobs.put(audio_data)
 
+    def transcribe(self, audio_data):
+        """Whisper speech-to-text for one dictation. The caller holds engine_lock.
+        Returns (text, language, language probability); text is "" when no
+        speech was found."""
+        # language=None lets faster-whisper detect the language on the first
+        # window; the detect_language patch restricts it to the 4 supported
+        # languages and the encoder cache makes detection nearly free.
+        target_lang = self.language if self.language in ALLOWED_LANGUAGES else None
+        segments, info = self.whisper_model.transcribe(
+            audio_data,
+            beam_size=1,
+            language=target_lang,
+            vad_filter=True,
+            vad_parameters=dict(min_silence_duration_ms=400),
+            without_timestamps=True,
+            condition_on_previous_text=False,
+            # initial_prompt biases decoding toward the dictionary spellings.
+            # (hotwords= was tested too, but it makes Whisper stutter on
+            # multi-word names: "Salesforce Force".)
+            initial_prompt=self.dictionary.whisper_prompt()
+        )
+        raw_text = " ".join([seg.text for seg in segments]).strip()
+        lang = info.language if info.language in ALLOWED_LANGUAGES else "en"
+        prob = info.language_probability if self.language is None else 1.0
+        return raw_text, lang, prob
+
     def _process_worker(self, audio_data):
         t0 = time.time()
         try:
             # 1. Local Whisper Speech-to-Text
-            # language=None lets faster-whisper detect the language on the first
-            # window; our _LanguageFilter restricts it to the 4 supported
-            # languages and the encoder cache makes detection nearly free.
-            target_lang = self.language if self.language in ALLOWED_LANGUAGES else None
-            dict_prompt = self.dictionary.whisper_prompt()
-
-            segments, info = self.whisper_model.transcribe(
-                audio_data,
-                beam_size=1,
-                language=target_lang,
-                vad_filter=True,
-                vad_parameters=dict(min_silence_duration_ms=400),
-                without_timestamps=True,
-                condition_on_previous_text=False,
-                # initial_prompt biases decoding toward the dictionary spellings.
-                # (hotwords= was tested too, but it makes Whisper stutter on
-                # multi-word names: "Salesforce Force".)
-                initial_prompt=dict_prompt
-            )
-            raw_text = " ".join([seg.text for seg in segments]).strip()
+            raw_text, target_lang, lang_prob = self.transcribe(audio_data)
             t_whisper = time.time() - t0
 
             if not raw_text:
                 log("[Info] No speech detected.")
                 return
 
-            target_lang = info.language if info.language in ALLOWED_LANGUAGES else "en"
-            lang_prob = info.language_probability if self.language is None else 1.0
             self.last_language = target_lang
             if self.config.get("last_language") != target_lang:
                 self.config["last_language"] = target_lang
@@ -745,13 +750,16 @@ class SpeakApp:
             log(f"[Error] Transcription failed: {e}")
             threading.Thread(target=self.play_sound, args=("error",), daemon=True).start()
 
-    def clean_text(self, raw_text, lang, use_llm=True, verbose=True, instructions=None):
+    def clean_text(self, raw_text, lang, use_llm=True, verbose=True, instructions=None, stats=None):
         """Dictionary fixes, Qwen cleanup (or the fast path for short clean
         phrases), then dictionary casing. Shared by dictation and meeting
         transcripts; the caller holds engine_lock. Meetings pass verbose=False:
         they skip the per-turn logs and the usage counts, which rank the
         user's own dictated words. instructions replaces the dictation system
-        prompt (meetings use a stricter "do not rephrase" one)."""
+        prompt (meetings use a stricter "do not rephrase" one). stats, when
+        given, receives "llm": True if Qwen was called (used by the benchmark)."""
+        if stats is not None:
+            stats["llm"] = False
         # Learned mishearings: confirmed ones are replaced right here, the
         # rest become a one-line hint for the LLM (only when relevant).
         text, dict_hint, applied = self.dictionary.prepare(raw_text, lang)
@@ -765,6 +773,8 @@ class SpeakApp:
                 if verbose:
                     log(f"[Fast path] Short clean phrase, LLM skipped: \"{text}\"")
             else:
+                if stats is not None:
+                    stats["llm"] = True
                 enhanced = self.format_text(text, lang, dict_hint, quiet=not verbose, instructions=instructions)
                 if enhanced:
                     text = enhanced

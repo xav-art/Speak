@@ -18,3 +18,9 @@ __pycache__/
 *.pyc
 .venv/
 venv/
+
+# Benchmark output (bench/run_bench.py)
+bench/results/
+
+# Salesforce CLI cache created when sf runs in this folder
+.sf/
