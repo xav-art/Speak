@@ -149,7 +149,11 @@ What Speak does with your words:
 
 1. **Whisper is primed** with your dictionary before every dictation, so it hears the right spelling in the first place.
 2. **Learned mishearings are corrected automatically** once they are confirmed: when the same context appears again, or after three corrections. Until then the AI cleanup gets a one-line hint.
-3. **Exact casing is enforced** for multi-word and unusually cased entries (`øresund bridge` becomes `Øresund Bridge`, `sap` becomes `SAP`).
+3. **Exact casing is enforced** for multi-word and unusually cased entries (`øresund bridge` becomes `Øresund Bridge`, `sap` becomes `SAP`). An entry written all in lowercase (`excel`) never removes the capital at the start of a sentence.
+
+A dictionary word in a short phrase does not slow it down: the AI step only runs for it when there is something only the AI can fix (a mishearing that is not confirmed yet, or a name such as *mette* that needs its capital).
+
+Add the words Whisper gets wrong (names, products, jargon), not everyday words. Every entry nudges Whisper towards hearing it, and a capitalized everyday word (*Service*) gets capitalized in the middle of sentences.
 
 Auto-learn ignores rewrites (more than half the words changed), everyday words, and anything shorter than three letters.
 
@@ -194,9 +198,9 @@ Settings are saved to `speak_config.json` when you change them in the app. You c
 | :--- | :--- | :--- |
 | `hotkey` | `<` | Dictation hotkey |
 | `learn_hotkey` | `CTRL+ALT+L` | Hotkey that learns a correction |
-| `model` | `base` | Whisper model: `tiny`, `base`, `small`, `medium` |
+| `model` | `base` | Whisper model: `tiny`, `base`, `small`, `medium`, `large-v3` (most accurate, slow on a laptop CPU) |
 | `language` | `null` | `null` for auto-detect, or `en`, `da`, `de`, `fr` |
-| `language_check_short_phrases` | `true` | For phrases of up to 4 seconds that Whisper hears as another language than your last one, also try your last language, and keep it if Whisper is clearly more sure of it |
+| `language_check_short_phrases` | `true` | For phrases of up to 4 seconds that Whisper hears as another language than your last one, also try your last language, and keep it if Whisper is clearly more sure of it. `true` does this on `tiny` and `base` only (measured on `medium`, the check fixed nothing and cost 3.4 s), `"always"` on every model, `false` never |
 | `ai_mode` | `local` | `local` (Qwen) or `off` (raw Whisper) |
 | `local_model` | `1.5b` | `1.5b` or `0.5b` |
 | `paste_mode` | `auto` | `auto`, `typing` or `clipboard` |
@@ -228,11 +232,11 @@ Measured on an Intel Core Ultra 7 265U with `faster-whisper-base` and Qwen 2.5 1
 | One encoder pass for language detection and transcription | Whisper stage **40 to 60% faster** (faster-whisper otherwise encodes the same 30 s window twice) |
 | Fast path for short, clean phrases (8 words or fewer, no fillers, commands or numbers). A filler at the start is removed by Speak itself, and filler lists are per language ("er" is a filler in English, "is" in Danish) | Language model skipped. In the benchmark, all short phrases now skip it (was about half), and they are inserted about 40% faster |
 | Clipboard restored on a timer after a paste | The next dictation no longer waits 0.8 s after every paste |
-| Short-phrase language check | A phrase of up to 4 s that Whisper hears as another language than your last one is decoded in both, greedily. Fixes short phrases such as *"Det er fint med mig"* that Whisper hears as German. Costs about 0.2 to 0.3 s, only when the languages disagree |
+| Short-phrase language check | A phrase of up to 4 s that Whisper hears as another language than your last one is decoded in both, greedily. Fixes short phrases such as *"Det er fint med mig"* that Whisper hears as German. Costs about 0.2 to 0.3 s on `base`, only when the languages disagree. Off by default on `small` and larger: measured on `medium`, it fixed nothing and cost 3.4 s |
 | Engines warmed up at startup | The first dictation is as fast as the rest |
 | `ABOVE_NORMAL` process priority | Chrome, Teams and Outlook cannot take the CPU during the ~2 s of processing |
 | Direct typing sends 32 characters per `SendInput` call | Insertion into terminals is about 20x faster |
-| Long dictations cleaned in sentence-aligned chunks | No silent truncation after about 100 words |
+| Long dictations cleaned in sentence-aligned chunks (at commas, or in equal pieces of up to 160 words, when Whisper wrote no full stops; the AI may then start a new sentence at such a split) | No silent truncation after about 100 words |
 
 Tested and rejected (kept as opt-in config keys): prompt-lookup speculative decoding (`speculative_decoding`, 2.5x *slower* on CPU with llama-cpp-python 0.3.x), flash attention (no gain), and Whisper `hotwords` (makes multi-word names stutter). On hybrid P/E-core CPUs, more Whisper threads were consistently *slower*.
 
@@ -269,11 +273,12 @@ Speak/
 
 ## Benchmark
 
-`bench/` measures speed and accuracy on 33 clips (English, Danish, German and French speech, and three clips with no speech at all). The clips are made with Windows and [Piper](https://github.com/rhasspy/piper) voices, so no real person's voice is recorded. The benchmark runs the real dictation pipeline but types nothing, never writes your settings and does not use your personal dictionary.
+`bench/` measures speed and accuracy on 33 clips (English, Danish, German and French speech, and three clips with no speech at all). The clips are made with Windows and [Piper](https://github.com/rhasspy/piper) voices, so no real person's voice is recorded. The benchmark runs the real dictation pipeline but types nothing, never writes your settings and does not use your personal dictionary. It uses an empty one, or a copy of the file you pass with `--dictionary`: `bench\dictionary_common.json` mixes names, acronyms and everyday words, like a real dictionary.
 
 ```powershell
 .venv\Scripts\python -X utf8 bench\run_bench.py --label my-change --repeat 3
 .venv\Scripts\python -X utf8 bench\run_bench.py --scenario other      # you just switched language
+.venv\Scripts\python -X utf8 bench\run_bench.py --set model=medium --dictionary bench\dictionary_common.json
 .venv\Scripts\python -X utf8 bench\run_bench.py --compare bench\results\A.json bench\results\B.json
 ```
 

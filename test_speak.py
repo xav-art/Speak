@@ -100,6 +100,207 @@ class TestDictionaryPersistenceAndUsage(unittest.TestCase):
         fixed = self.dict.apply_casing(text)
         self.assertEqual(fixed, "Welcome to Øresund Bridge and check PowerBI.")
 
+    def test_lowercase_entries_never_lowercase_a_sentence_start(self):
+        self.dict.add("excel")
+        self.dict.add("machine learning")
+        self.assertEqual(self.dict.apply_casing("Machine learning in Excel."), "Machine learning in Excel.")
+        self.assertEqual(self.dict.apply_casing("Done.\nMachine learning next."), "Done.\nMachine learning next.")
+        text, hint, applied, needs_llm = self.dict.prepare("Excel is open.", "en")
+        # Qwen hears to keep the capital, never "keep 'excel'".
+        self.assertEqual((text, needs_llm), ("Excel is open.", False))
+        self.assertIn("keep 'Excel'", hint)
+        self.assertNotIn("'excel'", hint)
+        # Never 'keep Excel' and 'Excel is spelled excel' at once.
+        hint = self.dict.prepare("Excel is open, open Excel, open excel", "en")[1]
+        self.assertIn("'Excel' is spelled 'excel'", hint)
+        self.assertNotIn("keep 'Excel'", hint)
+
+    def test_lowercase_entries_keep_capitals_after_bullets_quotes_and_colons(self):
+        self.dict.add("machine learning")
+        for text in ("- Machine learning for all.", "\u2022 Machine learning for all.",
+                     '"Machine learning is hard."', "Done\u2026 Machine learning next.",
+                     "Note: Machine learning rocks.", "(Machine learning) is next."):
+            self.assertEqual(self.dict.apply_casing(text), text)
+        # At a sentence start only the first letter is the sentence's.
+        self.assertEqual(self.dict.apply_casing("Machine Learning is hard."), "Machine learning is hard.")
+        self.dict.add("excel")
+        self.assertNotIn("'excel'", self.dict.prepare("- Excel is open.", "en")[1])
+        # A sentence closed inside brackets or quotes.
+        for text in ("(See above.) Machine learning next.", 'He said "done." Machine learning next.'):
+            self.assertEqual(self.dict.apply_casing(text), text)
+        # Mid-sentence look-alikes are not sentence starts.
+        self.assertEqual(self.dict.apply_casing("Ratio 3:1 Machine Learning."), "Ratio 3:1 machine learning.")
+        self.assertEqual(self.dict.apply_casing("the e-Machine Learning"), "the e-machine learning")
+
+    def test_lowercase_entries_still_apply_mid_sentence(self):
+        self.dict.add("webshop")
+        self.dict.add("machine learning")
+        self.assertEqual(self.dict.apply_casing("We use Machine Learning."), "We use machine learning.")
+        text, hint, applied, needs_llm = self.dict.prepare("Open the Webshop now", "en")
+        self.assertIn("'Webshop' is spelled 'webshop'", hint)   # for Qwen, if it runs
+        self.assertFalse(needs_llm)                             # but not worth waiting for
+
+    def test_every_occurrence_counts(self):
+        self.dict.add("Jira")
+        text, hint, applied, needs_llm = self.dict.prepare("Jira and jira", "en")
+        self.assertIn("'jira' is spelled 'Jira'", hint)
+        self.assertTrue(needs_llm)
+
+    def test_longest_entry_wins_a_span(self):
+        self.dict.add("Mette")
+        self.dict.add("Mette-Kristine")
+        text, hint, applied, needs_llm = self.dict.prepare("ring til mette-kristine", "da")
+        self.assertNotIn("'mette' staves", hint)
+        self.assertFalse(needs_llm)   # apply_casing fixes Mette-Kristine
+        self.assertEqual(self.dict.apply_casing("ring til mette-kristine"), "ring til Mette-Kristine")
+        self.assertTrue(self.dict.prepare("ring til mette og Mette-Kristine", "da")[3])
+
+    def test_neighbouring_entries_are_both_seen(self):
+        self.dict.add("New York")
+        self.dict.add("York Times")
+        hint = self.dict.prepare("the new york times", "en")[1]
+        self.assertIn("'new york' is spelled 'New York'", hint)
+        self.assertIn("'york times' is spelled 'York Times'", hint)
+
+    def _hold_file(self, path, seconds):
+        """Opens path with no sharing (as an antivirus scan or backup can) for
+        `seconds`, on a thread. Returns once the file is held."""
+        import ctypes
+        import threading
+        from ctypes import wintypes
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p,
+                                    wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+        k32.CreateFileW.restype = wintypes.HANDLE
+        k32.CloseHandle.argtypes = [wintypes.HANDLE]
+        GENERIC_READ, OPEN_EXISTING = 0x80000000, 3
+        handle = k32.CreateFileW(path, GENERIC_READ, 0, None, OPEN_EXISTING, 0, None)
+        self.assertNotIn(handle, (None, wintypes.HANDLE(-1).value))
+        t = threading.Timer(seconds, k32.CloseHandle, args=(handle,))
+        t.start()
+        self.addCleanup(t.join)
+        return t
+
+    def test_locked_file_at_start_is_never_overwritten(self):
+        self.dict.add("Annika")
+        self.dict.add("Mikkel")
+        with open(self.dict.path, encoding="utf-8") as f:
+            before = f.read()
+        held = self._hold_file(self.dict.path, 1.5)   # longer than load() retries
+        locked = sd.Dictionary(self.test_dir)
+        self.assertEqual(len(locked), 0)
+        self.assertTrue(locked.read_only)   # so the app can say nothing is saved
+        held.join()
+        locked.add("Learned")   # would have replaced both words with this one
+        with open(self.dict.path, encoding="utf-8") as f:
+            self.assertEqual(f.read(), before)
+        self.assertEqual([n for n in os.listdir(self.test_dir) if ".corrupt-" in n], [])
+
+    def test_briefly_locked_file_is_read_after_a_retry(self):
+        self.dict.add("Annika")
+        self._hold_file(self.dict.path, 0.15)
+        self.assertEqual(sd.Dictionary(self.test_dir).words(), ["Annika"])
+
+    def test_failed_save_leaves_no_temp_file(self):
+        self.dict.add("Annika")
+        held = self._hold_file(self.dict.path, 1.0)   # longer than save() retries
+        self.dict.add("Mikkel")
+        held.join()
+        self.assertFalse(os.path.exists(self.dict.path + ".tmp"))
+        self.dict.save()   # the next save brings the file up to date
+        self.assertEqual(len(sd.Dictionary(self.test_dir)), 2)
+
+    def test_concurrent_saves_never_leave_a_broken_file(self):
+        import threading
+        for i in range(300):
+            self.dict.entries[sd._fold(f"Word{i}")] = {"word": f"Word{i}", "source": "manual",
+                                                      "uses": 0, "added": "2026-10-14"}
+        broken, stop = [], threading.Event()
+
+        def reader():
+            while not stop.is_set():
+                try:
+                    with open(self.dict.path, encoding="utf-8") as f:
+                        json.load(f)
+                except OSError:
+                    pass   # being replaced right now
+                except ValueError as e:
+                    broken.append(str(e))
+                stop.wait(0.002)   # a busy reader, but not one that never lets go
+
+        def usage():
+            for _ in range(40):
+                self.dict.note_usage("Word1 and Word2")
+
+        def learn():
+            for i in range(40):
+                self.dict.add(f"Learned{i}")
+        self.dict.save()
+        threads = [threading.Thread(target=f) for f in (reader, usage, learn)]
+        for t in threads:
+            t.start()
+        threads[1].join()
+        threads[2].join()
+        stop.set()
+        threads[0].join()
+        self.assertEqual(broken, [])
+        self.assertEqual(len(sd.Dictionary(self.test_dir)), 340)
+
+    def test_wrong_shaped_file_is_kept_aside(self):
+        for content in ('{"words": "abc"}', '{"words": null}', '{"words": [{"word": "x", "uses": "many"}]}', "[]"):
+            with open(self.dict.path, "w", encoding="utf-8") as f:
+                f.write(content)
+            reloaded = sd.Dictionary(self.test_dir)   # must not raise
+            self.assertEqual(len(reloaded), 0)
+            self.assertFalse(reloaded.read_only)
+            self.assertFalse(os.path.exists(self.dict.path), content)
+        self.assertEqual(len([n for n in os.listdir(self.test_dir) if ".corrupt-" in n]), 4)
+
+    def test_unreadable_file_is_kept_aside_not_overwritten(self):
+        with open(self.dict.path, "w", encoding="utf-8") as f:
+            f.write('{"words": [{"word": "Annika"')   # cut off mid-write
+        reloaded = sd.Dictionary(self.test_dir)
+        self.assertEqual(len(reloaded), 0)
+        kept = [n for n in os.listdir(self.test_dir) if ".corrupt-" in n]
+        self.assertEqual(len(kept), 1)
+        with open(os.path.join(self.test_dir, kept[0]), encoding="utf-8") as f:
+            self.assertIn("Annika", f.read())
+
+    def test_correctly_spelled_words_do_not_need_the_llm(self):
+        self.dict.add("Jira")
+        self.dict.add("Service")
+        text, hint, applied, needs_llm = self.dict.prepare("Open Jira.", "en")
+        self.assertIn("keep 'Jira'", hint)        # still a hint if Qwen runs anyway
+        self.assertFalse(needs_llm)
+        text, hint, applied, needs_llm = self.dict.prepare("Service is down.", "en")
+        self.assertFalse(needs_llm)
+
+    def test_casing_fixed_by_apply_casing_does_not_need_the_llm(self):
+        self.dict.add("SAP")
+        self.dict.add("Business Central")
+        for raw in ("Check sap.", "Open business central."):
+            text, hint, applied, needs_llm = self.dict.prepare(raw, "en")
+            self.assertIn("is spelled", hint)
+            self.assertFalse(needs_llm, raw)
+
+    def test_name_casing_and_unconfirmed_mishearings_need_the_llm(self):
+        self.dict.add("Mette")
+        # apply_casing leaves 'mette' alone (it would also capitalize ordinary
+        # words), so only Qwen can fix it.
+        self.assertTrue(self.dict.prepare("ring til mette", "da")[3])
+        self.dict.record_correction("Anika", "Annika")   # seen once, no context yet
+        text, hint, applied, needs_llm = self.dict.prepare("Ask Anika.", "en")
+        self.assertEqual(applied, [])
+        self.assertIn("'Anika' is spelled 'Annika'", hint)
+        self.assertTrue(needs_llm)
+
+    def test_casing_is_enforced(self):
+        enforced = sd.Dictionary.casing_is_enforced
+        for word in ("SAP", "iPhone", "PowerBI", "Business Central", "KPI", "machine learning"):
+            self.assertTrue(enforced(word), word)
+        for word in ("Mette", "Service", "excel"):
+            self.assertFalse(enforced(word), word)
+
 
 class TestSpeakConfigAndFormatting(unittest.TestCase):
     def setUp(self):
@@ -546,28 +747,60 @@ class TestMeetingAudioFiles(unittest.TestCase):
 
 
 class TestSharedCleanup(unittest.TestCase):
-    def test_meeting_cleanup_skips_usage_counts_and_llm_when_off(self):
-        class FakeDict:
-            def __init__(self):
-                self.noted = []
+    class FakeDict:
+        def __init__(self):
+            self.noted = []
 
-            def prepare(self, text, lang):
-                return text.replace("sales force", "Salesforce"), "", [("sales force", "Salesforce")]
+        def prepare(self, text, lang):
+            return text.replace("sales force", "Salesforce"), "", [("sales force", "Salesforce")], False
 
-            def apply_casing(self, text):
-                return text
+        def apply_casing(self, text):
+            return text
 
-            def note_usage(self, text):
-                self.noted.append(text)
+        def note_usage(self, text):
+            self.noted.append(text)
 
+    def test_cleanup_never_counts_usage(self):
+        # Meeting turns must not rank the user's words, and dictation counts
+        # them in the worker, after the text is in.
         app = speak.SpeakApp.__new__(speak.SpeakApp)
         app.config = {}
-        app.dictionary = FakeDict()
+        app.dictionary = self.FakeDict()
         app.ai_mode, app.local_llm = "off", None
         self.assertEqual(app.clean_text("we use sales force", "en", verbose=False), "we use Salesforce")
-        self.assertEqual(app.dictionary.noted, [])
         app.clean_text("we use sales force", "en")
-        self.assertEqual(app.dictionary.noted, ["we use Salesforce"])
+        self.assertEqual(app.dictionary.noted, [])
+
+    def test_worker_counts_usage_after_insertion_without_locks(self):
+        import threading
+
+        class TrackedLock:
+            def __init__(self):
+                self.held = False
+
+            def __enter__(self):
+                self.held = True
+
+            def __exit__(self, *exc):
+                self.held = False
+
+        events = []
+        app = speak.SpeakApp.__new__(speak.SpeakApp)
+        app.config = {"last_language": "en"}
+        app.engine_lock, app.clipboard_lock = TrackedLock(), TrackedLock()
+        app.dictionary = self.FakeDict()
+        app.learn_hotkey_req = "<ctrl>+<alt>+l"
+        app.play_sound = lambda kind: None
+        app.transcribe = lambda audio: ("we use sales force", "en", 0.99)
+        app.clean_text = lambda raw, lang: "we use Salesforce"
+        app._schedule_clipboard_restore = lambda token: None
+        app.insert_text = lambda text: events.append("insert")
+
+        def note_usage(text):
+            events.append(("note", text, app.engine_lock.held, app.clipboard_lock.held))
+        app.dictionary.note_usage = note_usage
+        app._process_worker(np.zeros(16000, dtype=np.float32))
+        self.assertEqual(events, ["insert", ("note", "we use Salesforce", False, False)])
 
 
 class TestFastPath(unittest.TestCase):
@@ -708,6 +941,7 @@ class TestTranscribe(unittest.TestCase):
         app.language = None
         app.dictionary = SimpleNamespace(whisper_prompt=lambda: "Annika, SAP")
         app.whisper_model = whisper
+        app.model_size = "base"
         return app
 
     def _run(self, app):
@@ -762,6 +996,32 @@ class TestTranscribe(unittest.TestCase):
         self.assertEqual(self._run(app)[1], "de")
         self.assertEqual(len(whisper.calls), 1)
 
+    def test_check_runs_on_small_models_only_unless_always(self):
+        segs = {"de": [_seg(" Der fiegend mit mal.", logprob=-1.09)], "da": [_seg(" Det er fint med mig.", logprob=-0.41)]}
+        missing = object()
+        for model, setting, passes in (("tiny", True, 3), ("base", True, 3), ("small", True, 1),
+                                       ("medium", True, 1), ("large-v3", True, 1), ("base", missing, 3),
+                                       ("medium", missing, 1), ("medium", "always", 3), ("large-v3", " Always", 3),
+                                       ("base", 1, 3), ("base", "yes", 3), ("medium", 1, 1),
+                                       ("base", False, 1), ("base", None, 1), ("base", "off", 1)):
+            with self.subTest(model=model, setting=setting):
+                config = {"last_language": "da"}
+                if setting is not missing:
+                    config["language_check_short_phrases"] = setting
+                whisper = self.FakeWhisper(segs, "de")
+                app = self._app(whisper, config)
+                app.model_size = model
+                self._run(app)
+                self.assertEqual(len(whisper.calls), passes)
+
+    def test_always_still_skips_long_dictations(self):
+        whisper = self.FakeWhisper({"de": [_seg(" Lang.", logprob=-1.0)], "da": [_seg(" Lang.", logprob=-0.1)]},
+                                   "de", speech_seconds=5.0)
+        app = self._app(whisper, {"last_language": "da", "language_check_short_phrases": "always"})
+        app.model_size = "medium"
+        self._run(app)
+        self.assertEqual(len(whisper.calls), 1)
+
 
 class TestCleanTextFastPath(unittest.TestCase):
     def _app(self):
@@ -769,7 +1029,7 @@ class TestCleanTextFastPath(unittest.TestCase):
         app = speak.SpeakApp.__new__(speak.SpeakApp)
         app.config = {}
         app.ai_mode, app.local_llm = "local", object()
-        app.dictionary = SimpleNamespace(prepare=lambda text, lang: (text, "", []),
+        app.dictionary = SimpleNamespace(prepare=lambda text, lang: (text, "", [], False),
                                          apply_casing=lambda text: text, note_usage=lambda text: None)
         app.llm_calls = []
 
@@ -799,6 +1059,22 @@ class TestCleanTextFastPath(unittest.TestCase):
         app.config = {"llm_fast_path": False}
         app.clean_text("Nej tak.", "da", verbose=False)
         self.assertEqual(app.llm_calls, ["Nej tak."])
+
+    def test_dictionary_words_keep_the_fast_path(self):
+        # Dictionaries hold everyday words too ('claim', 'Service'): a short
+        # clean phrase containing one must not wait for Qwen.
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        app = self._app()
+        app.dictionary = sd.Dictionary(tmp)
+        for word in ("claim", "Jira", "SAP", "Mette"):
+            app.dictionary.add(word)
+        self.assertEqual(app.clean_text("open the claim in Jira and sap", "en", verbose=False),
+                         "Open the claim in Jira and SAP.")
+        self.assertEqual(app.llm_calls, [])
+        # A name in the wrong case is the LLM's job: apply_casing leaves it.
+        app.clean_text("ring til mette", "da", verbose=False)
+        self.assertEqual(app.llm_calls, ["ring til mette"])
 
 
 class TestClipboardRestore(unittest.TestCase):
@@ -853,7 +1129,7 @@ class TestClipboardRestore(unittest.TestCase):
             self.app._schedule_clipboard_restore((self.snapshot, 5, time.time()))
             # A second dictation pastes before the restore: it must restore
             # the user's text later, not the first dictation.
-            self.assertEqual(self.app._take_pending_restore(), self.snapshot)
+            self.assertEqual(self.app._take_pending_restore()[:2], (self.snapshot, 5))
         self._wait_for_timer()
         self.assertEqual(self.restored, [])   # the cancelled timer did nothing
 
@@ -929,10 +1205,79 @@ class TestClipboardRestore(unittest.TestCase):
         self.assertIsNotNone(token)
         self.assertEqual(token[0], self.snapshot)
 
+    def test_failed_clipboard_write_keeps_the_original_sequence_number(self):
+        # The app holding the clipboard may have just put the user's new copy
+        # on it. The restore must see that change (seq 5 -> 6) and skip,
+        # not adopt seq 6 and overwrite the copy.
+        import time
+        self._prepare_win32_fakes()
+
+        def busy_clipboard(text):
+            self.fake.seq = 6
+            return False
+        self.app._set_clipboard_text = busy_clipboard
+        with self.app.clipboard_lock:
+            self.app._schedule_clipboard_restore((self.snapshot, 5, time.time() - 1.0))
+            token = self.app.insert_text("dictation two")
+        self.assertEqual(token[:2], (self.snapshot, 5))
+
     def test_no_token_schedules_nothing(self):
         with self.app.clipboard_lock:
             self.app._schedule_clipboard_restore(None)
         self.assertIsNone(self.app._pending_restore)
+
+
+class TestLongDictation(unittest.TestCase):
+    def _app(self):
+        app = speak.SpeakApp.__new__(speak.SpeakApp)
+        app.LLM_CHUNK_WORDS = 10
+        return app
+
+    def test_sentences_are_kept_whole(self):
+        text = "One two three four five six. Seven eight nine ten eleven twelve."
+        self.assertEqual(self._app()._split_for_llm(text),
+                         ["One two three four five six.", "Seven eight nine ten eleven twelve."])
+
+    def test_text_without_full_stops_is_still_split(self):
+        app = self._app()
+        commas = "one two three four five six, seven eight nine ten eleven twelve, thirteen fourteen"
+        bare = " ".join(f"w{i}" for i in range(25))
+        for text in (commas, bare):
+            chunks = app._split_for_llm(text)
+            self.assertGreater(len(chunks), 1)
+            self.assertTrue(all(len(c.split()) <= 10 for c in chunks), chunks)
+            self.assertEqual(" ".join(chunks).split(), text.split())   # nothing lost or reordered
+
+    def test_no_tiny_last_chunk(self):
+        # 21 bare words with a limit of 10: [7, 7, 7], not [10, 10, 1].
+        chunks = self._app()._split_for_llm(" ".join(f"w{i}" for i in range(21)))
+        self.assertEqual([len(c.split()) for c in chunks], [7, 7, 7])
+
+
+class TestAutoStop(unittest.TestCase):
+    def test_one_stop_thread_at_the_time_limit(self):
+        import threading
+        import time
+        app = speak.SpeakApp.__new__(speak.SpeakApp)
+        app.sample_rate, app.MAX_RECORDING_SECONDS = 16000, 1
+        app.is_recording, app._auto_stop_requested = True, False
+        app.audio_frames = [np.zeros((1600, 1), dtype=np.float32)] * 10   # exactly 1 s
+        stops = []
+        started, release = threading.Event(), threading.Event()
+
+        def slow_stop():
+            stops.append(threading.current_thread())
+            started.set()
+            release.wait(5)   # the stream keeps delivering blocks meanwhile
+        app.stop_recording = slow_stop
+        block = np.zeros((1600, 1), dtype=np.float32)
+        app.audio_callback(block, 1600, None, None)
+        self.assertTrue(started.wait(5))
+        for _ in range(4):
+            app.audio_callback(block, 1600, None, None)
+        release.set()
+        stops[0].join(5)
+        self.assertEqual(len(stops), 1)
 
 
 class TestKeyInput(unittest.TestCase):

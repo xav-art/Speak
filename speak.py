@@ -109,6 +109,17 @@ _kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
 _kernel32.OpenProcess.restype = wintypes.HANDLE
 _kernel32.QueryFullProcessImageNameW.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)]
 _kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
+_kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+_kernel32.SetPriorityClass.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+_kernel32.SetPriorityClass.restype = wintypes.BOOL
+_kernel32.SetConsoleTitleW.argtypes = [wintypes.LPCWSTR]
+_kernel32.SetConsoleTitleW.restype = wintypes.BOOL
+_user32.PeekMessageW.argtypes = [ctypes.POINTER(wintypes.MSG), wintypes.HWND, wintypes.UINT, wintypes.UINT, wintypes.UINT]
+_user32.PeekMessageW.restype = wintypes.BOOL
+_user32.TranslateMessage.argtypes = [ctypes.POINTER(wintypes.MSG)]
+_user32.TranslateMessage.restype = wintypes.BOOL
+_user32.DispatchMessageW.argtypes = [ctypes.POINTER(wintypes.MSG)]
+_user32.DispatchMessageW.restype = ctypes.c_ssize_t
 
 # Windows Virtual Key Codes & Modifiers
 WM_HOTKEY = 0x0312
@@ -304,6 +315,9 @@ def prepare_console():
 
 _CONFIG_LOCK = threading.Lock()
 
+# Whisper sizes offered by the m menu and --model.
+WHISPER_MODELS = ("tiny", "base", "small", "medium", "large-v3")
+
 def load_config(path=None):
     path = path or CONFIG_PATH
     defaults = {
@@ -449,9 +463,12 @@ class SpeakApp:
             log(f"[AI Warning] Could not load the summary model ({e}).")
             return None
 
-    def __init__(self, config):
+    def __init__(self, config, load_speech_model=True):
+        """load_speech_model=False (--transcribe-meeting) skips the dictation
+        Whisper model: meetings load their own meeting_model."""
         self.config = config
         self.model_size = config.get("model", "base")
+        self._auto_stop_requested = False
 
         # Speak idles at 0% CPU but needs the whole machine for ~2s after each
         # dictation. ABOVE_NORMAL keeps Chrome/Teams/Outlook from stealing those
@@ -459,8 +476,7 @@ class SpeakApp:
         if config.get("high_priority", True):
             try:
                 ABOVE_NORMAL_PRIORITY_CLASS = 0x8000
-                handle = ctypes.windll.kernel32.GetCurrentProcess()
-                ctypes.windll.kernel32.SetPriorityClass(handle, ABOVE_NORMAL_PRIORITY_CLASS)
+                _kernel32.SetPriorityClass(_kernel32.GetCurrentProcess(), ABOVE_NORMAL_PRIORITY_CLASS)
             except Exception:
                 pass
         self.hotkey_req = self._normalize_key(config.get("hotkey", "<"))
@@ -514,12 +530,14 @@ class SpeakApp:
         self.init_ai()
 
         # Initialize Local Faster-Whisper using self-contained models directory
-        log(f"[Whisper] Loading local speech model 'faster-whisper-{self.model_size}' on CPU (int8)...")
-        log(f"[Whisper] Storage Path: {self.model_storage_path}")
-        self.whisper_model = self._load_whisper(self.model_size)
-        log(f"[Whisper] Model 'faster-whisper-{self.model_size}' is ready.")
+        self.whisper_model = None
+        if load_speech_model:
+            log(f"[Whisper] Loading local speech model 'faster-whisper-{self.model_size}' on CPU (int8)...")
+            log(f"[Whisper] Storage Path: {self.model_storage_path}")
+            self.whisper_model = self._load_whisper(self.model_size)
+            log(f"[Whisper] Model 'faster-whisper-{self.model_size}' is ready.")
 
-        if self.config.get("warm_up", True):
+        if self.config.get("warm_up", True) and self.whisper_model is not None:
             self.warm_up()
 
         self.worker_thread = threading.Thread(target=self._worker_loop, name="speak-worker", daemon=True)
@@ -666,7 +684,11 @@ class SpeakApp:
         if self.is_recording:
             self.audio_frames.append(indata.copy())
             # Auto-stop if recording is left active indefinitely
-            if len(self.audio_frames) * frames / self.sample_rate > self.MAX_RECORDING_SECONDS:
+            # Blocks keep arriving until the stop thread has closed the
+            # stream: start that thread once, not once per block.
+            if (len(self.audio_frames) * frames / self.sample_rate > self.MAX_RECORDING_SECONDS
+                    and not self._auto_stop_requested):
+                self._auto_stop_requested = True
                 log(f"[Audio Info] Maximum recording duration ({self.MAX_RECORDING_SECONDS}s) reached. Stopping automatically.")
                 threading.Thread(target=self.stop_recording, daemon=True).start()
 
@@ -681,6 +703,7 @@ class SpeakApp:
             if self.is_recording:
                 return
             self.audio_frames = []
+            self._auto_stop_requested = False
             self.is_recording = True
             try:
                 self.record_stream = sd.InputStream(
@@ -743,6 +766,17 @@ class SpeakApp:
     # detected language, against 0.29 and more for real corrections.
     LANGUAGE_CHECK_MAX_SPEECH = 4.0
     LANGUAGE_CHECK_MARGIN = 0.25
+    # With medium on the benchmark the check fixed no detection and made a
+    # short phrase in another language 3.4 s slower. `true` checks on these
+    # models only, "always" on all of them.
+    LANGUAGE_CHECK_MODELS = ("tiny", "base")
+
+    def _language_check_enabled(self):
+        # Hand-edited configs: "Always", 1, "true", "yes" mean what they say.
+        setting = str(self.config.get("language_check_short_phrases", True)).strip().lower()
+        if setting == "always":
+            return True
+        return setting in ("true", "1", "yes", "on") and self.model_size in self.LANGUAGE_CHECK_MODELS
 
     def transcribe(self, audio_data):
         """Whisper speech-to-text for one dictation. The caller holds engine_lock.
@@ -759,7 +793,7 @@ class SpeakApp:
         prob = info.language_probability if self.language is None else 1.0
 
         if (target_lang is None and last and lang != last and text
-                and self.config.get("language_check_short_phrases", True)
+                and self._language_check_enabled()
                 and getattr(info, "duration_after_vad", 0.0) <= self.LANGUAGE_CHECK_MAX_SPEECH):
             # Both candidates are decoded greedily so their scores compare like
             # for like. Whisper's temperature fallback would re-decode up to 5
@@ -844,6 +878,11 @@ class SpeakApp:
                 # pasted, without holding up the next dictation meanwhile.
                 self._schedule_clipboard_restore(restore_token)
 
+            # Usage counts rank the user's words for the Whisper prompt. This
+            # writes the dictionary file, so it runs once the text is in and
+            # holds neither lock. (Meeting turns are not counted.)
+            self.dictionary.note_usage(final_text)
+
         except Exception as e:
             log(f"[Error] Transcription failed: {e}")
             threading.Thread(target=self.play_sound, args=("error",), daemon=True).start()
@@ -851,16 +890,15 @@ class SpeakApp:
     def clean_text(self, raw_text, lang, use_llm=True, verbose=True, instructions=None, stats=None):
         """Dictionary fixes, Qwen cleanup (or the fast path for short clean
         phrases), then dictionary casing. Shared by dictation and meeting
-        transcripts; the caller holds engine_lock. Meetings pass verbose=False:
-        they skip the per-turn logs and the usage counts, which rank the
-        user's own dictated words. instructions replaces the dictation system
+        transcripts; the caller holds engine_lock. Meetings pass verbose=False
+        to skip the per-turn logs. instructions replaces the dictation system
         prompt (meetings use a stricter "do not rephrase" one). stats, when
         given, receives "llm": True if Qwen was called (used by the benchmark)."""
         if stats is not None:
             stats["llm"] = False
         # Learned mishearings: confirmed ones are replaced right here, the
         # rest become a one-line hint for the LLM (only when relevant).
-        text, dict_hint, applied = self.dictionary.prepare(raw_text, lang)
+        text, dict_hint, applied, hint_needs_llm = self.dictionary.prepare(raw_text, lang)
         if verbose:
             for heard, word in applied:
                 log(f"[Dictionary] '{heard}' -> '{word}' (learned correction)")
@@ -868,7 +906,10 @@ class SpeakApp:
         if use_llm and self.ai_mode != "off" and self.local_llm:
             # "Um, yes." is a short clean phrase once the leading filler is gone.
             stripped = speak_text.strip_leading_fillers(text)
-            if self.config.get("llm_fast_path", True) and not dict_hint and not speak_text.needs_llm(stripped, lang):
+            # A dictionary word that is already spelled right (or that
+            # apply_casing fixes below) is no reason to wait for Qwen.
+            if (self.config.get("llm_fast_path", True) and not hint_needs_llm
+                    and not speak_text.needs_llm(stripped, lang)):
                 text = speak_text.light_cleanup(stripped) if stripped else ""
                 if verbose:
                     log(f"[Fast path] Short clean phrase, LLM skipped: \"{text}\"")
@@ -882,10 +923,7 @@ class SpeakApp:
                         log(f"[AI Formatted]: \"{text}\"")
 
         # Deterministic safety net: dictionary spellings always win.
-        text = self.dictionary.apply_casing(text)
-        if verbose:
-            self.dictionary.note_usage(text)
-        return text
+        return self.dictionary.apply_casing(text)
 
     def format_text(self, text, lang, dict_hint="", quiet=False, instructions=None):
         if not text or not text.strip():
@@ -904,7 +942,22 @@ class SpeakApp:
         if len(words) <= self.LLM_CHUNK_WORDS:
             return [text]
         import re
-        sentences = re.split(r"(?<=[.!?])\s+", text)
+        limit = self.LLM_CHUNK_WORDS
+        sentences = []
+        for s in re.split(r"(?<=[.!?])\s+", text):
+            if len(s.split()) <= limit:
+                sentences.append(s)
+                continue
+            # Whisper sometimes writes a long, fast stretch with only commas:
+            # split it at clauses, and as a last resort every `limit` words.
+            for clause in re.split(r"(?<=[,;:])\s+", s):
+                cw = clause.split()
+                if len(cw) <= limit:
+                    sentences.append(clause)
+                else:
+                    # Equal pieces: [160, 1] would send Qwen a one-word "text".
+                    size = -(-len(cw) // -(-len(cw) // limit))
+                    sentences.extend(" ".join(cw[i:i + size]) for i in range(0, len(cw), size))
         chunks, current = [], []
         for s in sentences:
             if current and len(" ".join(current + [s]).split()) > self.LLM_CHUNK_WORDS:
@@ -1087,7 +1140,7 @@ You are an intelligent voice dictation assistant. Clean up this spoken transcrip
         for i in range(0, len(events), self.TYPE_CHUNK * 2):
             batch = events[i:i + self.TYPE_CHUNK * 2]
             arr = (INPUT * len(batch))(*batch)
-            ctypes.windll.user32.SendInput(len(batch), arr, ctypes.sizeof(INPUT))
+            _user32.SendInput(len(batch), arr, ctypes.sizeof(INPUT))
             time.sleep(0.002)
 
     # ---- Clipboard save / restore -------------------------------------------
@@ -1177,11 +1230,11 @@ You are an intelligent voice dictation assistant. Clean up this spoken transcrip
 
     def _take_pending_restore(self):
         """Cancels a scheduled restore before Speak uses the clipboard again.
-        Returns the user's saved clipboard while Speak's pasted text is still
-        on it, so the next restore puts back the user's content and not the
-        previous dictation. Returns None when nothing is pending or the user
-        has copied something since (that is then the clipboard to keep).
-        Call with clipboard_lock held."""
+        Returns the pending restore token (snapshot, our_seq, time) while
+        Speak's pasted text is still on the clipboard, so the next restore puts
+        back the user's content and not the previous dictation. Returns None
+        when nothing is pending or the user has copied something since (that
+        is then the clipboard to keep). Call with clipboard_lock held."""
         token, timer = self._pending_restore, self._pending_restore_timer
         if not token:
             return None
@@ -1196,8 +1249,7 @@ You are an intelligent voice dictation assistant. Clean up this spoken transcrip
         self._pending_restore = self._pending_restore_timer = None
         if timer:
             timer.cancel()
-        snapshot, our_seq, _ = token
-        return snapshot if _user32.GetClipboardSequenceNumber() == our_seq else None
+        return token if _user32.GetClipboardSequenceNumber() == token[1] else None
 
     def flush_clipboard_restore(self):
         """Restores a pending clipboard now (on exit, so it is not lost)."""
@@ -1255,7 +1307,7 @@ You are an intelligent voice dictation assistant. Clean up this spoken transcrip
             return None
 
         inherited = self._take_pending_restore()
-        snapshot = inherited or self._clipboard_snapshot()
+        snapshot = inherited[0] if inherited else self._clipboard_snapshot()
         if not self._set_clipboard_text(text):
             # Pasting now would insert whatever is on the clipboard (the user's
             # content or the previous dictation). Type the text instead.
@@ -1263,8 +1315,11 @@ You are an intelligent voice dictation assistant. Clean up this spoken transcrip
             self.type_unicode_text(text)
             if inherited is None:
                 return None   # the clipboard still holds the user's own content
-            # A previous dictation is still on the clipboard: keep its restore.
-            return (snapshot, _user32.GetClipboardSequenceNumber(), time.time())
+            # A previous dictation is still on the clipboard: keep its restore,
+            # with its own sequence number. The current one may already belong
+            # to the app holding the clipboard, and restoring over that would
+            # destroy what the user just copied.
+            return (snapshot, inherited[1], time.time())
         our_seq = _user32.GetClipboardSequenceNumber()
 
         time.sleep(0.05)
@@ -1325,7 +1380,7 @@ You are an intelligent voice dictation assistant. Clean up this spoken transcrip
         # release, or the app receives Ctrl+Alt+C instead of Ctrl+C.
         self._release_modifiers(timeout=0.6)
         inherited = self._take_pending_restore()
-        snapshot = inherited or self._clipboard_snapshot()
+        snapshot = inherited[0] if inherited else self._clipboard_snapshot()
         seq_before = _user32.GetClipboardSequenceNumber()
         send_keys(chord(VK_CONTROL, VK_C))
 
@@ -1363,8 +1418,10 @@ You are an intelligent voice dictation assistant. Clean up this spoken transcrip
 
         added = self.dictionary.learn_from_correction(self.last_inserted_text, corrected)
         if added:
+            saved = ("NOT saved: the dictionary file could not be read at startup, restart Speak"
+                     if self.dictionary.read_only else "saved to personal dictionary")
             for heard, new in added:
-                log(f"[Learned] '{heard}' -> '{new}'  (saved to personal dictionary, {len(self.dictionary)} words)")
+                log(f"[Learned] '{heard}' -> '{new}'  ({saved}, {len(self.dictionary)} words)")
             log("          Whisper will now be primed with this spelling; the mishearing is auto-replaced once confirmed.")
             threading.Thread(target=self.play_sound, args=("success",), daemon=True).start()
         else:
@@ -1469,7 +1526,7 @@ You are an intelligent voice dictation assistant. Clean up this spoken transcrip
                 self.register_hotkeys()
 
             # Handle every queued message, not one per 20 ms.
-            while ctypes.windll.user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, PM_REMOVE):
+            while _user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, PM_REMOVE):
                 if msg.message == WM_HOTKEY:
                     if msg.wParam == self.LEARN_HOTKEY_ID:
                         threading.Thread(target=self.learn_from_selection, daemon=True).start()
@@ -1477,8 +1534,8 @@ You are an intelligent voice dictation assistant. Clean up this spoken transcrip
                         threading.Thread(target=self.meetings.toggle, daemon=True).start()
                     else:
                         self.toggle_recording()
-                ctypes.windll.user32.TranslateMessage(ctypes.byref(msg))
-                ctypes.windll.user32.DispatchMessageW(ctypes.byref(msg))
+                _user32.TranslateMessage(ctypes.byref(msg))
+                _user32.DispatchMessageW(ctypes.byref(msg))
             time.sleep(0.02)
         self.unregister_hotkeys()
 
@@ -1644,7 +1701,8 @@ You are an intelligent voice dictation assistant. Clean up this spoken transcrip
                         self.init_ai()
                     elif sub == "4":
                         log("\n[Testing] Testing with: 'uh I think we should bullet point deploy the change new line bullet point notify the team'...")
-                        test_out = self.format_text("uh I think we should bullet point deploy the change new line bullet point notify the team", "en")
+                        with self.engine_lock:   # shared with dictation and meeting cleanup
+                            test_out = self.format_text("uh I think we should bullet point deploy the change new line bullet point notify the team", "en")
                         log(f"[Result]:\n{test_out}")
                     self.print_status_banner()
 
@@ -1670,6 +1728,8 @@ You are an intelligent voice dictation assistant. Clean up this spoken transcrip
                     log("  c - Clear the whole dictionary")
                     log(f"  Tip: after dictating, fix any wrong word in your app, select the sentence and tap {self.learn_hotkey_req}.")
                     log("  Enter - Return to main menu")
+                    if self.dictionary.read_only:
+                        log("  Note: the dictionary file could not be read at startup. Changes last until you restart Speak and are not saved.")
                     sub = input("Choose option [a/r/i/c]: ").strip().lower()
                     if sub == "a":
                         raw = input("Words to add: ").strip()
@@ -1705,9 +1765,9 @@ You are an intelligent voice dictation assistant. Clean up this spoken transcrip
 
                 elif cmd in ("m", "model"):
                     log("\n--- CHANGE WHISPER MODEL ---")
-                    log("Options: medium (high accuracy, recommended), base (faster), small, tiny")
-                    new_m = input("Enter model size [tiny/base/small/medium]: ").strip().lower()
-                    if new_m in ("tiny", "base", "small", "medium"):
+                    log("Options: medium (high accuracy, recommended), base (faster), small, tiny, large-v3 (most accurate, slow on CPU)")
+                    new_m = input("Enter model size [tiny/base/small/medium/large-v3]: ").strip().lower()
+                    if new_m in WHISPER_MODELS:
                         target_dir = os.path.join(MODELS_DIR, f"models--Systran--faster-whisper-{new_m}")
                         if not os.path.exists(target_dir):
                             confirm = input(f"Model '{new_m}' is not bundled locally. Download now via Hugging Face? (y/N): ").strip().lower()
@@ -1783,7 +1843,7 @@ if __name__ == "__main__":
                         help="Set global hotkey (e.g. '<', '>', '<>', 'F8', 'Pause'). Default reads from config.")
     parser.add_argument("--paste-mode", default=None, choices=["auto", "typing", "clipboard"],
                         help="Paste mode: 'auto', 'typing' (direct typewriter), or 'clipboard'.")
-    parser.add_argument("--model", default=None, choices=["tiny", "base", "small", "medium", "large-v3"],
+    parser.add_argument("--model", default=None, choices=WHISPER_MODELS,
                         help="Whisper model size. Default reads from config.")
     parser.add_argument("--language", default=None, choices=["en", "da", "de", "fr", "auto"],
                         help="Language code ('en', 'da', 'de', 'fr', 'auto'). Default reads from config.")
@@ -1803,7 +1863,7 @@ if __name__ == "__main__":
         # Runs next to a Speak window too: no hotkeys, no mutex, config not saved.
         cfg = load_config()
         cfg["warm_up"] = False
-        app = SpeakApp(cfg)
+        app = SpeakApp(cfg, load_speech_model=False)
         try:
             app.meetings.process(os.path.abspath(args.transcribe_meeting))
         except Exception as e:

@@ -3,13 +3,14 @@ Speak benchmark: runs every clip in bench/clips through the real dictation
 pipeline (Whisper, dictionary, fast path or Qwen) and reports speed and accuracy.
 
 Nothing is typed or pasted, your speak_config.json is never written, and your
-personal dictionary is not used (an empty one is), so results are comparable
-between machines and over time.
+personal dictionary is not used (an empty one is, or a copy of the file given
+with --dictionary), so results are comparable between machines and over time.
 
 Usage (from the Speak folder, with Speak's Python):
   python -X utf8 bench/run_bench.py --label baseline
   python -X utf8 bench/run_bench.py --label small --set model=small --repeat 3
   python -X utf8 bench/run_bench.py --scenario other     # last language is a different one
+  python -X utf8 bench/run_bench.py --dictionary bench/dictionary_common.json   # a filled dictionary
   python -X utf8 bench/run_bench.py --compare bench/results/A.json bench/results/B.json
 
 Scenarios set the "last language" Speak remembers before each clip:
@@ -134,6 +135,9 @@ def run(args):
     if args.only:
         corpus = [c for c in corpus if args.only in c["id"]]
 
+    if args.dictionary:
+        # A copy: the run must never change the file it was given.
+        shutil.copyfile(args.dictionary, os.path.join(tmp, "speak_dictionary.json"))
     t0 = time.time()
     app = speak.SpeakApp(cfg)
     app.dictionary = Dictionary(tmp)
@@ -186,6 +190,7 @@ def run(args):
         "config": {k: cfg.get(k) for k in ("model", "local_model", "ai_mode", "whisper_threads", "llm_threads",
                                            "llm_fast_path", "language", "language_check_short_phrases")},
         "overrides": parse_overrides(args.set),
+        "dictionary": os.path.basename(args.dictionary) if args.dictionary else None,
         "summary": summarize(rows), "clips": rows,
     }
     print_summary(result)
@@ -238,7 +243,8 @@ def print_row(r):
 def print_summary(result):
     s = result["summary"]
     print(f"\n== {result['label']} ({result['revision']}, scenario {result['scenario']}, "
-          f"model {result['config']['model']}, repeat {result['repeat']}) ==")
+          f"model {result['config']['model']}, repeat {result['repeat']}, "
+          f"dictionary {result.get('dictionary') or 'empty'}) ==")
     print(f"{'group':<16}{'clips':>6}{'WER':>8}{'STT WER':>9}{'lang':>7}{'fast':>7}"
           f"{'median s':>10}{'mean s':>8}{'stt s':>7}{'llm s':>7}{'fmt':>5}")
     for key, b in s.items():
@@ -280,6 +286,8 @@ def main():
     parser.add_argument("--repeat", type=int, default=1, help="runs per clip; timings are the median")
     parser.add_argument("--set", action="append", metavar="KEY=VALUE", help="override a config key (JSON value)")
     parser.add_argument("--only", help="only run clips whose id contains this text")
+    parser.add_argument("--dictionary", metavar="JSON",
+                        help="run with a copy of this dictionary file instead of an empty one")
     parser.add_argument("--out", help="where to save the JSON results")
     parser.add_argument("--compare", nargs=2, metavar=("A.json", "B.json"), help="compare two saved runs")
     args = parser.parse_args()

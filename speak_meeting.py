@@ -20,6 +20,7 @@ Everything runs offline, after the recording stops:
 """
 
 import bisect
+import ctypes
 import datetime
 import gc
 import json
@@ -33,9 +34,15 @@ import time
 import warnings
 import wave
 
+from ctypes import wintypes
+
 import numpy as np
 
 import speak_text
+
+_kernel32 = ctypes.WinDLL("kernel32")
+_kernel32.SetConsoleTitleW.argtypes = [wintypes.LPCWSTR]
+_kernel32.SetConsoleTitleW.restype = wintypes.BOOL
 
 SAMPLE_RATE = 16000
 SHERPA_RELEASES = "https://github.com/k2-fsa/sherpa-onnx/releases/download"
@@ -1468,7 +1475,6 @@ class MeetingManager:
 
 def _set_title(title):
     try:
-        import ctypes
-        ctypes.windll.kernel32.SetConsoleTitleW(title)
+        _kernel32.SetConsoleTitleW(title)
     except Exception:
         pass
