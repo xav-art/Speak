@@ -484,6 +484,12 @@ class Dictionary:
             return None
         return ", ".join(words) + "."
 
+    def correction_pairs(self):
+        """(heard, word) for every learned mishearing: the LLM may make these
+        replacements (see speak_text.cleanup_is_faithful)."""
+        with self.lock:
+            return [(c["heard"], c["word"]) for c in self.corrections.values()]
+
     @staticmethod
     def casing_is_enforced(word):
         """True when apply_casing() fixes this entry's spelling by itself:

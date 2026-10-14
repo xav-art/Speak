@@ -136,6 +136,20 @@ Type these in the Speak window:
 
 Command-line options: `--hotkey`, `--model`, `--language`, `--paste-mode`, `--ai-mode`. Run `speak --help` for details.
 
+### Spoken commands
+
+Say these while you dictate, after a short pause:
+
+| Say | Danish | German | French | Result |
+| :--- | :--- | :--- | :--- | :--- |
+| *new line* | *ny linje* | *neue Zeile* | *à la ligne*, *nouvelle ligne* | Line break |
+| *new paragraph*, *next paragraph* | *nyt afsnit* | *neuer Absatz* | *nouveau paragraphe* | Empty line |
+| *bullet point* | *punkt* | *Aufzählungspunkt* | *puce* | New line starting with `- ` |
+| *scratch that*, *delete that* (as a sentence of its own) | *slet det* | *streich das* | *efface ça* | Deletes the sentence before it |
+| *no wait*, *sorry* | *nej vent* | *nein warte* | *non attends* | Keeps only the correction: *"on Tuesday, no wait, Wednesday"* becomes *"on Wednesday"* |
+
+*New line*, *bullet point* and *scratch that* work only as commands: *"our new line of candles"* stays as it is. Speak applies those itself when Whisper wrote a pause (a comma or full stop) before them, and *punkt* or *puce* when it starts a sentence (*"Punkt opdater prislisten."*, but not *"Punkt 3 er vigtigt."*). Otherwise, and for the corrections, the AI step does it. With AI cleanup turned off (`a`, then `3`), Speak inserts exactly what Whisper heard.
+
 ## Personal dictionary
 
 Speak keeps your word list in `speak_dictionary.json`, next to `speak.py`. It never leaves your PC.
@@ -179,7 +193,7 @@ How it works:
 
 - **Who spoke when:** [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) speaker diarization (pyannote segmentation and NeMo TitaNet speaker embeddings, about 47 MB, no PyTorch). Speakers that match your voice sample become *Me*, everyone else *Person 1*, *Person 2* and so on, numbered in order of appearance.
 - **What was said:** Whisper `small` (more accurate on long, mixed audio than the dictation model). Each speaker's language is detected separately, so a Danish colleague stays Danish in an English meeting.
-- **Cleanup:** only turns with fillers or stutters go to Qwen, with a strict "do not rephrase" prompt. If the model changes the meaning anyway, the turn is kept as spoken.
+- **Cleanup:** only turns with fillers or stutters go to Qwen, which may remove only those. Spoken commands are not applied in meetings. If the model drops or changes a word anyway, the turn is kept as spoken.
 - **Decisions and action items:** Speak finds the sentences where someone promises something (*"I will"*, *"jeg vil"*), asks for something (*"can you"*, *"kan du"*) or agrees on something (*"let us"*, *"lad os"*). Qwen then rewrites each one as a short to-do with its deadline. The owner comes from the transcript, not from the AI: whoever made the promise, or whoever said yes to a request. A request nobody agreed to is listed with who raised it. Every item shows when it was said, so you can check it.
 - **Summary:** Qwen writes a short summary paragraph. It is a small model, so read it before you forward it.
 
@@ -206,7 +220,7 @@ Settings are saved to `speak_config.json` when you change them in the app. You c
 | `paste_mode` | `auto` | `auto`, `typing` or `clipboard` |
 | `whisper_threads` | `4` | CPU threads for Whisper |
 | `llm_threads` | `6` | CPU threads for Qwen |
-| `llm_fast_path` | `true` | Skip the AI step for short, clean phrases. A filler at the start (*um*, *øh*) does not stop a phrase from counting as clean: Speak removes it itself |
+| `llm_fast_path` | `true` | Skip the AI step for short, clean phrases. A filler at the start (*um*, *øh*) does not stop a phrase from counting as clean: Speak removes it itself (in German, *um* is a word and stays) |
 | `warm_up` | `true` | Warm up both models at startup so the first dictation is fast |
 | `high_priority` | `true` | Run at above-normal priority so busy apps do not slow processing down |
 | `meeting_hotkey` | `CTRL+ALT+M` | Hotkey that starts and stops a meeting recording |
@@ -236,7 +250,8 @@ Measured on an Intel Core Ultra 7 265U with `faster-whisper-base` and Qwen 2.5 1
 | Engines warmed up at startup | The first dictation is as fast as the rest |
 | `ABOVE_NORMAL` process priority | Chrome, Teams and Outlook cannot take the CPU during the ~2 s of processing |
 | Direct typing sends 32 characters per `SendInput` call | Insertion into terminals is about 20x faster |
-| Long dictations cleaned in sentence-aligned chunks (at commas, or in equal pieces of up to 160 words, when Whisper wrote no full stops; the AI may then start a new sentence at such a split) | No silent truncation after about 100 words |
+| One cleanup prompt for all four languages, with worked examples. Speak itself removes filler sounds and applies *new line*, *bullet point* and *scratch that* before the AI runs, and rejects any AI output that drops, adds or translates words | On a set of 39 dictations and meeting turns, word errors after cleanup fell from 17% to under 1%: the old per-language prompts dropped *"I think"*, *"please"* and introduction lines, and missed half the line breaks. Each AI call is also about 15% faster: the prompt stays cached when you switch language |
+| Long dictations cleaned in sentence-aligned chunks (at line breaks first, at commas, or in equal pieces of up to 160 words, when Whisper wrote no full stops; the AI may then start a new sentence at such a split) | No silent truncation after about 100 words |
 
 Tested and rejected (kept as opt-in config keys): prompt-lookup speculative decoding (`speculative_decoding`, 2.5x *slower* on CPU with llama-cpp-python 0.3.x), flash attention (no gain), and Whisper `hotwords` (makes multi-word names stutter). On hybrid P/E-core CPUs, more Whisper threads were consistently *slower*.
 

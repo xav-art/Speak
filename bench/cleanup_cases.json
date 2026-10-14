@@ -1,0 +1,242 @@
+[
+ {
+  "id": "b-en-filler-mid",
+  "lang": "en",
+  "raw": "Um, I think we should move the meeting to Thursday.",
+  "expected": "I think we should move the meeting to Thursday."
+ },
+ {
+  "id": "b-en-bullets",
+  "lang": "en",
+  "raw": "Here are the next steps. Bullet point update the price list. Bullet point send the newsletter.",
+  "expected": "Here are the next steps:\n- Update the price list.\n- Send the newsletter."
+ },
+ {
+  "id": "b-en-newline",
+  "lang": "en",
+  "raw": "Hi Anna, new line thanks for the meeting yesterday.",
+  "expected": "Hi Anna,\nThanks for the meeting yesterday."
+ },
+ {
+  "id": "b-en-numbers",
+  "lang": "en",
+  "raw": "The order ships on March 14 and costs 250 kroner.",
+  "expected": "The order ships on March 14 and costs 250 kroner."
+ },
+ {
+  "id": "b-en-please",
+  "lang": "en",
+  "raw": "Please send the report to Annika and Mikkel in Aarhus.",
+  "expected": "Please send the report to Annika and Mikkel in Aarhus."
+ },
+ {
+  "id": "b-en-long",
+  "lang": "en",
+  "raw": "We need to, we need to finalize the autumn campaign before Friday. The photos are ready, but the discount codes are still not working in the webshop, so I will ask the developers to look at it today and report back tomorrow morning.",
+  "expected": "We need to finalize the autumn campaign before Friday. The photos are ready, but the discount codes are still not working in the webshop, so I will ask the developers to look at it today and report back tomorrow morning."
+ },
+ {
+  "id": "b-da-filler-lead",
+  "lang": "da",
+  "raw": "Hør, jeg tror vi skal flytte mødet til torsdag.",
+  "expected": "Hør, jeg tror vi skal flytte mødet til torsdag."
+ },
+ {
+  "id": "b-da-newline",
+  "lang": "da",
+  "raw": "Hej Anna, ny linje, tak for mødet i går.",
+  "expected": "Hej Anna,\nTak for mødet i går."
+ },
+ {
+  "id": "b-da-numbers",
+  "lang": "da",
+  "raw": "Ordren bliver sendt den 14. marts og koster 250 kr.",
+  "expected": "Ordren bliver sendt den 14. marts og koster 250 kr."
+ },
+ {
+  "id": "b-da-long",
+  "lang": "da",
+  "raw": "Vi skal have styr på efterårskampagnen inden fredag. Billederne er klar, men rabatgoderne virker stadig ikke i webshoppen, så jeg bedre udviklerne om at kigge på det i dag og vende tilbage i morgen tidlig.",
+  "expected": "Vi skal have styr på efterårskampagnen inden fredag. Billederne er klar, men rabatgoderne virker stadig ikke i webshoppen, så jeg bedre udviklerne om at kigge på det i dag og vende tilbage i morgen tidlig."
+ },
+ {
+  "id": "b-de-filler-lead",
+  "lang": "de",
+  "raw": "E, ich glaube, wir sollten das Meeting auf Donnerstag verschieben.",
+  "expected": "Ich glaube, wir sollten das Meeting auf Donnerstag verschieben."
+ },
+ {
+  "id": "b-de-long",
+  "lang": "de",
+  "raw": "Wir müssen die Herbstkappagne bis Freitag fertig stellen. Die Fotos sind fertig, aber die Rabattcodes funktionieren im Webshop immer noch nicht, deshalb bitte ich die Entwickler, sich das heute anzusehen.",
+  "expected": "Wir müssen die Herbstkappagne bis Freitag fertig stellen. Die Fotos sind fertig, aber die Rabattcodes funktionieren im Webshop immer noch nicht, deshalb bitte ich die Entwickler, sich das heute anzusehen."
+ },
+ {
+  "id": "b-fr-filler-lead",
+  "lang": "fr",
+  "raw": "Ah, je pense qu'on devrait dépasser la réunion à jeudi.",
+  "expected": "Je pense qu'on devrait dépasser la réunion à jeudi."
+ },
+ {
+  "id": "b-fr-long",
+  "lang": "fr",
+  "raw": "Nous devons finaliser la campagne d'automne avant vendredi. Les photos sont prêtes mais les codes de réduction ne fonctionnent toujours pas sur la boutique en ligne donc je vais demander aux développeurs de regarder aujourd'hui.",
+  "expected": "Nous devons finaliser la campagne d'automne avant vendredi. Les photos sont prêtes, mais les codes de réduction ne fonctionnent toujours pas sur la boutique en ligne, donc je vais demander aux développeurs de regarder aujourd'hui."
+ },
+ {
+  "id": "en-correction",
+  "lang": "en",
+  "raw": "Let's meet on Tuesday, no wait, Wednesday at ten.",
+  "expected": "Let's meet on Wednesday at ten."
+ },
+ {
+  "id": "en-mid-fillers",
+  "lang": "en",
+  "raw": "Can you, uh, check the invoice and, um, call the supplier?",
+  "expected": "Can you check the invoice and call the supplier?"
+ },
+ {
+  "id": "en-question",
+  "lang": "en",
+  "raw": "What do you think about the new design? I think it looks great, but the logo is too small.",
+  "expected": "What do you think about the new design? I think it looks great, but the logo is too small."
+ },
+ {
+  "id": "en-instruction",
+  "lang": "en",
+  "raw": "Write a short summary of the meeting and send it to the whole team.",
+  "expected": "Write a short summary of the meeting and send it to the whole team."
+ },
+ {
+  "id": "en-i-mean",
+  "lang": "en",
+  "raw": "I'm not sure, I mean, it could work, but we need more data first.",
+  "expected": "I'm not sure, it could work, but we need more data first."
+ },
+ {
+  "id": "en-scratch",
+  "lang": "en",
+  "raw": "The budget is ten thousand. Scratch that. The budget is twelve thousand.",
+  "expected": "The budget is twelve thousand."
+ },
+ {
+  "id": "en-sorry",
+  "lang": "en",
+  "raw": "Can we order fifty, sorry, sixty boxes for the shop?",
+  "expected": "Can we order sixty boxes for the shop?"
+ },
+ {
+  "id": "fr-correction",
+  "lang": "fr",
+  "raw": "On se voit mardi, non attends, mercredi à dix heures.",
+  "expected": "On se voit mercredi à dix heures."
+ },
+ {
+  "id": "en-maybe",
+  "lang": "en",
+  "raw": "Maybe we could, um, ask Peter if he has time on Friday afternoon.",
+  "expected": "Maybe we could ask Peter if he has time on Friday afternoon."
+ },
+ {
+  "id": "da-mid-fillers",
+  "lang": "da",
+  "raw": "Kan du, øh, sende fakturaen til Mette i dag?",
+  "expected": "Kan du sende fakturaen til Mette i dag?"
+ },
+ {
+  "id": "da-correction",
+  "lang": "da",
+  "raw": "Vi ses på tirsdag, nej vent, onsdag klokken ti.",
+  "expected": "Vi ses på onsdag klokken ti."
+ },
+ {
+  "id": "da-bullets",
+  "lang": "da",
+  "raw": "Her er punkterne. Punkt opdater prislisten. Punkt send nyhedsbrevet.",
+  "expected": "Her er punkterne:\n- Opdater prislisten.\n- Send nyhedsbrevet."
+ },
+ {
+  "id": "da-question",
+  "lang": "da",
+  "raw": "Hvad synes du om det nye design, øh, og skal vi vise det til butikkerne på fredag?",
+  "expected": "Hvad synes du om det nye design, og skal vi vise det til butikkerne på fredag?"
+ },
+ {
+  "id": "da-jeg-tror",
+  "lang": "da",
+  "raw": "Øh, jeg tror ikke, at leverandøren kan levere før uge 42.",
+  "expected": "Jeg tror ikke, at leverandøren kan levere før uge 42."
+ },
+ {
+  "id": "de-bitte",
+  "lang": "de",
+  "raw": "Ähm, kannst du bitte die Rechnung an Herrn Weber schicken?",
+  "expected": "Kannst du bitte die Rechnung an Herrn Weber schicken?"
+ },
+ {
+  "id": "de-newline",
+  "lang": "de",
+  "raw": "Hallo Thomas, neue Zeile, danke für das Treffen gestern.",
+  "expected": "Hallo Thomas,\nDanke für das Treffen gestern."
+ },
+ {
+  "id": "de-correction",
+  "lang": "de",
+  "raw": "Wir treffen uns am Dienstag, nein warte, am Mittwoch um zehn.",
+  "expected": "Wir treffen uns am Mittwoch um zehn."
+ },
+ {
+  "id": "fr-mid-filler",
+  "lang": "fr",
+  "raw": "Euh, est-ce que tu peux envoyer le devis à Claire, euh, avant midi ?",
+  "expected": "Est-ce que tu peux envoyer le devis à Claire avant midi ?"
+ },
+ {
+  "id": "fr-newline",
+  "lang": "fr",
+  "raw": "Bonjour Marc, à la ligne, merci pour la réunion d'hier.",
+  "expected": "Bonjour Marc,\nMerci pour la réunion d'hier."
+ },
+ {
+  "id": "m-en-stutter",
+  "lang": "en",
+  "meeting": true,
+  "raw": "Um, I will, I will send the the numbers to Anna by Friday.",
+  "expected": "I will send the numbers to Anna by Friday."
+ },
+ {
+  "id": "m-en-plain",
+  "lang": "en",
+  "meeting": true,
+  "raw": "So, uh, the main problem is that the stores don't get the new prices in time.",
+  "expected": "So, the main problem is that the stores don't get the new prices in time."
+ },
+ {
+  "id": "m-da-giver",
+  "lang": "da",
+  "meeting": true,
+  "raw": "Jeg giver, øh, butikkerne besked i morgen.",
+  "expected": "Jeg giver butikkerne besked i morgen."
+ },
+ {
+  "id": "m-da-long",
+  "lang": "da",
+  "meeting": true,
+  "raw": "Øh, altså, vi har haft rigtig mange returneringer i september, og og jeg tror det skyldes, at størrelserne er forkerte på hjemmesiden.",
+  "expected": "Altså, vi har haft rigtig mange returneringer i september, og jeg tror det skyldes, at størrelserne er forkerte på hjemmesiden."
+ },
+ {
+  "id": "m-de-stutter",
+  "lang": "de",
+  "meeting": true,
+  "raw": "Ich, äh, ich schicke dir die Präsentation heute Abend.",
+  "expected": "Ich schicke dir die Präsentation heute Abend."
+ },
+ {
+  "id": "m-fr-stutter",
+  "lang": "fr",
+  "meeting": true,
+  "raw": "Euh, on peut, on peut décaler la réunion à lundi ?",
+  "expected": "On peut décaler la réunion à lundi ?"
+ }
+]

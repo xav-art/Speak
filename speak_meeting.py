@@ -67,26 +67,10 @@ EMBEDDING_MODEL = {
 
 LANGUAGE_NAMES = {"en": "English", "da": "Danish", "de": "German", "fr": "French"}
 
-# Meeting turns are cleaned far more conservatively than dictation: with the
-# dictation prompt, Qwen 1.5B rewrote "Jeg giver butikkerne besked" into
-# "Butikkerne har beskrevet" (wrong meaning) in testing. Written in each
-# language so the model does not drift into English.
-MEETING_CLEANUP_PROMPTS = {
-    "en": ("Clean up this spoken meeting turn. Remove filler words (um, uh, you know, like) and accidental "
-           "repetitions. Fix punctuation and capitalization. Do NOT rephrase, shorten, summarize or translate: "
-           "keep every other word exactly as spoken. Output only the cleaned text."),
-    "da": ("Ryd op i denne talte replik fra et møde. Fjern fyldord (øh, altså, ikke også) og utilsigtede "
-           "gentagelser. Ret tegnsætning og store bogstaver. Du må IKKE omformulere, forkorte, opsummere eller "
-           "oversætte: behold alle andre ord præcis som de blev sagt. Udskriv kun den rensede tekst."),
-    "de": ("Bereinige diesen gesprochenen Redebeitrag aus einem Meeting. Entferne Füllwörter (äh, ähm, also, "
-           "quasi) und versehentliche Wiederholungen. Korrigiere Zeichensetzung und Groß-/Kleinschreibung. "
-           "Formuliere NICHT um, kürze nicht, fasse nicht zusammen und übersetze nicht: Behalte alle anderen "
-           "Wörter genau so, wie sie gesagt wurden. Gib nur den bereinigten Text aus."),
-    "fr": ("Nettoie cette intervention orale d'une réunion. Supprime les mots de remplissage (euh, ben, genre, "
-           "en fait) et les répétitions involontaires. Corrige la ponctuation et les majuscules. Ne reformule PAS, "
-           "ne raccourcis pas, ne résume pas et ne traduis pas : garde tous les autres mots exactement tels qu'ils "
-           "ont été dits. Renvoie uniquement le texte nettoyé."),
-}
+# Meeting turns are cleaned with the dictation prompt plus a note that asks for
+# fillers and stutters only (speak.MEETING_TURN_NOTE), and every result is
+# checked by faithful(): with a plain dictation prompt Qwen 1.5B rewrote
+# "Jeg giver butikkerne besked" into "Butikkerne har beskrevet" in testing.
 
 ECHO_CORRELATION = 0.3          # above this, the call is audible in the mic (no headset)
 ENROLL_SECONDS = 30
@@ -530,31 +514,13 @@ def _norm_word(word):
     return "".join(ch for ch in word.lower() if ch.isalnum())
 
 
-# Words a cleanup may drop without changing what was said.
-SPOKEN_FILLERS = {
-    "um", "uh", "uhm", "umm", "hmm", "hm", "mm", "erm", "er", "ah", "eh", "oh", "like", "you", "know", "i", "mean",
-    "so", "well", "okay", "ok", "basically", "actually", "right", "yeah",
-    "øh", "øhm", "øhh", "altså", "sådan", "ikke", "også", "ikk", "jo", "nå", "ja", "nu",
-    "äh", "ähm", "also", "quasi", "sozusagen", "halt", "naja",
-    "euh", "ben", "bah", "genre", "en", "fait", "du", "coup", "bon", "voilà",
-}
-
-
-def faithful(original, cleaned, max_changed=0.1):
+def faithful(original, cleaned, lang=None):
     """True when the cleanup only dropped fillers and repeats and fixed
-    punctuation. Removing or adding content words is rewording: in testing
-    Qwen turned "Jeg giver butikkerne besked" into "Du giver besked", which
-    a plain length check let through."""
-    from collections import Counter
-    a = [_norm_word(w) for w in original.split() if _norm_word(w)]
-    b = [_norm_word(w) for w in cleaned.split() if _norm_word(w)]
-    if not a or not b:
-        return not a and not b
-    removed = Counter(a) - Counter(b)
-    added = Counter(b) - Counter(a)
-    content_removed = sum(n for w, n in removed.items() if w not in SPOKEN_FILLERS)
-    allowance = max(1, int(max_changed * len(a)))
-    return content_removed <= allowance and sum(added.values()) <= allowance
+    punctuation (speak_text.cleanup_is_faithful, shared with dictation).
+    Removing or adding content words is rewording: in testing Qwen turned
+    "Jeg giver butikkerne besked" into "Du giver besked", which a plain
+    length check let through."""
+    return speak_text.cleanup_is_faithful(original, cleaned, lang, meeting=True)
 
 
 def echo_correlation(mic, system, segments, frame=400, max_lag_frames=12):
@@ -1353,14 +1319,16 @@ class MeetingManager:
                 # The dictation LLM is shared: hold the engine lock one turn at a
                 # time so a dictation never waits longer than a single turn.
                 with self.app.engine_lock:
-                    cleaned = self.app.clean_text(
-                        t["text"], t["lang"], verbose=False,
-                        instructions=MEETING_CLEANUP_PROMPTS.get(t["lang"], MEETING_CLEANUP_PROMPTS["en"]))
+                    cleaned = self.app.clean_text(t["text"], t["lang"], verbose=False, meeting=True)
                 cleaned = cleaned.lstrip("-*• ").strip()
-                if faithful(text, cleaned):
+                # Compared with the turn as Qwen got it: code already removed
+                # the filler sounds (a German "E," included).
+                prepared = speak_text.prepare_for_llm(text, t["lang"], commands=False)
+                if faithful(prepared, cleaned, t["lang"]):
                     text = cleaned
                 else:
-                    rejected += 1   # the model reworded it: keep what was said
+                    rejected += 1   # the model reworded it: keep what was said, minus filler sounds
+                    text = prepared or text
             t["text"] = speak_text.light_cleanup(text)
         if todo:
             print(flush=True)

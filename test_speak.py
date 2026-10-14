@@ -1033,7 +1033,7 @@ class TestCleanTextFastPath(unittest.TestCase):
                                          apply_casing=lambda text: text, note_usage=lambda text: None)
         app.llm_calls = []
 
-        def fake_format(text, lang, dict_hint="", quiet=False, instructions=None):
+        def fake_format(text, lang, dict_hint="", quiet=False, meeting=False):
             app.llm_calls.append(text)
             return "LLM: " + text
         app.format_text = fake_format
@@ -1047,12 +1047,25 @@ class TestCleanTextFastPath(unittest.TestCase):
         self.assertEqual(app.clean_text("Um.", "en", verbose=False), "")
         self.assertEqual(app.llm_calls, [])
 
-    def test_llm_gets_the_original_text(self):
+    def test_llm_gets_the_text_without_filler_sounds(self):
         app = self._app()
         stats = {}
         self.assertEqual(app.clean_text("Um, it was, like, huge", "en", verbose=False, stats=stats),
-                         "LLM: Um, it was, like, huge")
+                         "LLM: It was, like, huge")
         self.assertEqual(stats, {"llm": True})
+        # Spoken commands are applied for dictation, never for a meeting turn.
+        app.clean_text("Hi Anna, new line thanks for, uh, the meeting yesterday", "en", verbose=False)
+        app.clean_text("Hi Anna, new line thanks for, uh, the meeting yesterday", "en", verbose=False, meeting=True)
+        self.assertEqual(app.llm_calls[-2:], ["Hi Anna,\nThanks for the meeting yesterday",
+                                              "Hi Anna, new line thanks for the meeting yesterday"])
+
+    def test_only_filler_sounds_skip_the_llm(self):
+        app = self._app()
+        app.config = {"llm_fast_path": False}
+        stats = {}
+        self.assertEqual(app.clean_text("Um, uh.", "en", verbose=False, stats=stats), "")
+        self.assertEqual(stats, {"llm": False})
+        self.assertEqual(app.llm_calls, [])
 
     def test_fast_path_can_be_turned_off(self):
         app = self._app()
@@ -1074,7 +1087,7 @@ class TestCleanTextFastPath(unittest.TestCase):
         self.assertEqual(app.llm_calls, [])
         # A name in the wrong case is the LLM's job: apply_casing leaves it.
         app.clean_text("ring til mette", "da", verbose=False)
-        self.assertEqual(app.llm_calls, ["ring til mette"])
+        self.assertEqual(app.llm_calls, ["Ring til mette"])
 
 
 class TestClipboardRestore(unittest.TestCase):
@@ -1295,6 +1308,394 @@ class TestKeyInput(unittest.TestCase):
         self.assertEqual(flags[2], speak.KEYEVENTF_EXTENDEDKEY | speak.KEYEVENTF_KEYUP)
         self.assertEqual(flags[3], speak.KEYEVENTF_KEYUP)
         self.assertTrue(all(e.u.ki.wScan for e in events))                            # scan codes filled in
+
+
+class TestSpokenCommandsAndFillers(unittest.TestCase):
+    def test_line_break_and_list_commands_in_four_languages(self):
+        cases = {
+            "Hi Anna, new line thanks for the meeting yesterday.": "Hi Anna,\nThanks for the meeting yesterday.",
+            "Hej Anna, ny linje, tak for mødet i går.": "Hej Anna,\nTak for mødet i går.",
+            "Hallo Thomas, neue Zeile, danke für das Treffen gestern.": "Hallo Thomas,\nDanke für das Treffen gestern.",
+            "Bonjour Marc, à la ligne, merci pour la réunion d'hier.": "Bonjour Marc,\nMerci pour la réunion d'hier.",
+            "Here are the next steps. Bullet point update the price list. Bullet point send the newsletter.":
+                "Here are the next steps.\n- Update the price list.\n- Send the newsletter.",
+            "That was all. New paragraph, next topic.": "That was all.\n\nNext topic.",
+        }
+        for said, expected in cases.items():
+            self.assertEqual(st.prepare_for_llm(said, "en"), expected, said)
+
+    def test_command_words_that_are_ordinary_words_stay(self):
+        for text in ("Our new line of candles arrives Monday.", "We launch the new line, which sells well.",
+                     "Vores nye linje af lys kommer mandag.", "Delete that file before Monday.",
+                     "Add a bullet point here.", "Please scratch that from the list.", "Please scratch that."):
+            self.assertEqual(st.prepare_for_llm(text, "en"), text, text)
+
+    def test_scratch_that_deletes_the_sentence_before(self):
+        self.assertEqual(st.prepare_for_llm("The budget is ten thousand. Scratch that. The budget is twelve thousand.", "en"),
+                         "The budget is twelve thousand.")
+        self.assertEqual(st.prepare_for_llm("Slet det. Vi ses i morgen.", "da"), "Vi ses i morgen.")
+        self.assertEqual(st.prepare_for_llm("Hi Anna,\nwrong line. Scratch that.\nSee you.", "en"), "Hi Anna,\nSee you.")
+
+    def test_meeting_turns_keep_command_words(self):
+        said = "We said new line, uh, for the shelves. Scratch that, it was the other one."
+        self.assertEqual(st.prepare_for_llm(said, "en", commands=False),
+                         "We said new line for the shelves. Scratch that, it was the other one.")
+
+    def test_filler_sounds_are_removed_with_their_commas(self):
+        self.assertEqual(st.prepare_for_llm("Can you, uh, check the invoice and, um, call the supplier?", "en"),
+                         "Can you check the invoice and call the supplier?")
+        self.assertEqual(st.prepare_for_llm("Euh, est-ce que tu peux, euh, venir ?", "fr"), "Est-ce que tu peux venir ?")
+        self.assertEqual(st.prepare_for_llm("Uh-huh, I agree. Um.", "en"), "Uh-huh, I agree.")
+        self.assertEqual(st.prepare_for_llm("Um, uh.", "en"), "")
+
+    def test_um_is_a_german_word(self):
+        self.assertEqual(st.prepare_for_llm("Um zehn Uhr treffen wir uns, um das zu klären.", "de"),
+                         "Um zehn Uhr treffen wir uns, um das zu klären.")
+        self.assertEqual(st.strip_leading_fillers("Um zehn Uhr passt.", "de"), "Um zehn Uhr passt.")
+        self.assertEqual(st.strip_leading_fillers("Um, ten is fine.", "en"), "Ten is fine.")
+        self.assertFalse(st.has_disfluency("Wir treffen uns um zehn.", "de"))
+        self.assertEqual(st.strip_leading_fillers("E, ich glaube schon.", "de"), "Ich glaube schon.")
+        self.assertEqual(st.strip_leading_fillers("Um, ten is fine."), "Ten is fine.")   # no language: as before
+
+    def test_light_cleanup_keeps_line_breaks(self):
+        self.assertEqual(st.light_cleanup("hi  Anna,\n\n\n thanks"), "Hi Anna,\n\nthanks.")
+        self.assertEqual(st.light_cleanup("  done  "), "Done.")
+
+
+class TestCleanupIsFaithful(unittest.TestCase):
+    def test_accepts_cleanup(self):
+        ok = [
+            ("Um, I think we should, uh, move the meeting.", "I think we should move the meeting.", "en"),
+            ("We need to, we need to finalize it.", "We need to finalize it.", "en"),
+            ("It was, like, huge, you know.", "It was huge.", "en"),
+            ("Let's meet on Tuesday, no wait, Wednesday at ten.", "Let's meet on Wednesday at ten.", "en"),
+            ("Wir müssen das fertig stellen.", "Wir müssen das fertigstellen.", "de"),
+            ("Her er punkterne. Punkt priser. Punkt varer.", "Her er punkterne:\n- Priser.\n- Varer.", "da"),
+            ("hi anna\nthanks for yesterday", "Hi Anna,\nThanks for yesterday.", "en"),
+            ("Øh altså jeg tror at vi vi skal flytte det.", "Jeg tror, at vi skal flytte det.", "da"),
+        ]
+        for before, after, lang in ok:
+            self.assertTrue(st.cleanup_is_faithful(before, after, lang), (before, after))
+
+    def test_rejects_rewording(self):
+        bad = [
+            ("Please send the report to Annika.", "Send the report to Annika.", "en"),      # seen in the benchmark
+            ("I think we should move the meeting.", "We should move the meeting.", "en"),   # seen, all 4 languages
+            ("Jeg giver butikkerne besked i morgen.", "Jeg giver besked i morgen.", "da"),
+            ("Jeg tror ikke, at det virker.", "Jeg tror, at det virker.", "da"),
+            ("We need it, so I will ask the developers.", "We need it. I will ask the developers.", "en"),
+            ("Ordren bliver sendt den 14. marts.", "The order is sent on March 14.", "da"),   # translated
+            ("Hi Anna,\nThanks for yesterday.", "Hi Anna, thanks for yesterday.", "en"),       # line break merged
+            ("Write a summary of the meeting.", "Summary: the meeting discussed the budget and the launch.", "en"),
+        ]
+        for before, after, lang in bad:
+            self.assertFalse(st.cleanup_is_faithful(before, after, lang), (before, after))
+
+    def test_dictionary_replacements_are_allowed(self):
+        before, after = "Ring til Anika i morgen.", "Ring til Annika i morgen."
+        self.assertFalse(st.cleanup_is_faithful(before, after, "da"))
+        self.assertTrue(st.cleanup_is_faithful(before, after, "da", [("Anika", "Annika")]))
+        self.assertTrue(st.cleanup_is_faithful("Open power bi now.", "Open PowerBI now.", "en", [("power bi", "PowerBI")]))
+
+    def test_empty_text(self):
+        self.assertTrue(st.cleanup_is_faithful("", ""))
+        self.assertFalse(st.cleanup_is_faithful("Hello there.", ""))
+        self.assertFalse(st.cleanup_is_faithful("", "Hello."))
+
+    def test_meeting_faithful_uses_the_same_check(self):
+        self.assertFalse(sm.faithful("Jeg giver butikkerne besked i morgen.", "Jeg giver besked i morgen.", "da"))
+        self.assertTrue(sm.faithful("Um, I will, I will send the the numbers.", "I will send the numbers.", "en"))
+
+
+class TestCleanupPrompt(unittest.TestCase):
+    def test_prefix_is_the_same_for_every_call(self):
+        # llama.cpp reuses the evaluated prompt up to the first differing token:
+        # language, dictionary hint and meeting mode must all come after it.
+        prompts = [speak.build_cleanup_prompt("Hello there.", "en"),
+                   speak.build_cleanup_prompt("Hej med dig.", "da", dict_hint="\nPersonlig ordbog: behold 'SAP'."),
+                   speak.build_cleanup_prompt("Hallo.", "de", meeting=True),
+                   speak.build_cleanup_prompt("Bonjour.", "fr")]
+        fixed = prompts[0][:prompts[0].rindex("<|im_start|>user\n")]
+        self.assertTrue(fixed.endswith(speak.CLEANUP_EXAMPLES[-1][1] + "<|im_end|>\n"), fixed[-80:])
+        for p in prompts:
+            self.assertTrue(p.startswith(fixed))
+            self.assertTrue(p.endswith("<|im_start|>assistant\n"))
+
+    def test_notes(self):
+        en = speak.build_cleanup_prompt("Hello.", "en")
+        self.assertEqual(en.count("<|im_start|>system"), 1)   # English needs no note
+        da = speak.build_cleanup_prompt("Hej.", "da", dict_hint="\nPersonlig ordbog: behold 'SAP'.", meeting=True)
+        note = da.rsplit("<|im_start|>system\n", 1)[1].split("<|im_end|>")[0]
+        self.assertEqual(note, f"{speak.MEETING_TURN_NOTE} Personlig ordbog: behold 'SAP'. Write in Danish.")
+        self.assertTrue(da.endswith("<|im_start|>user\nHej.<|im_end|>\n<|im_start|>assistant\n"))
+
+    def test_examples_teach_only_what_the_guard_accepts(self):
+        for said, cleaned in speak.CLEANUP_EXAMPLES:
+            self.assertTrue(st.cleanup_is_faithful(said, cleaned), (said, cleaned))
+            self.assertNotIn("<|im_", said + cleaned)
+
+
+class TestLlmGuard(unittest.TestCase):
+    class FakeLlm:
+        def __init__(self, answer):
+            self.answer, self.prompts = answer, []
+
+        def tokenize(self, data, add_bos=False):
+            return data.split()
+
+        def __call__(self, prompt, **kwargs):
+            self.prompts.append(prompt)
+            answer = self.answer(prompt) if callable(self.answer) else self.answer
+            return {"choices": [{"text": answer}], "usage": {"completion_tokens": 3}}
+
+    def _app(self, answer):
+        from types import SimpleNamespace
+        app = speak.SpeakApp.__new__(speak.SpeakApp)
+        app.ai_mode, app.llm_ctx = "local", 2048
+        app.local_llm = self.FakeLlm(answer)
+        app.dictionary = SimpleNamespace(correction_pairs=lambda: [("Anika", "Annika")])
+        return app
+
+    def test_rewording_falls_back_to_the_transcript(self):
+        app = self._app("Send the report to Annika.")
+        self.assertEqual(app.format_text("please send the report to Annika", "en", quiet=True),
+                         "Please send the report to Annika.")
+        app = self._app("We should send it.")   # dropped words AND a merged line break
+        self.assertEqual(app.format_text("Hi Anna,\nwe should send it", "en", quiet=True), "Hi Anna,\nwe should send it.")
+
+    def test_faithful_output_and_dictionary_fix_are_kept(self):
+        app = self._app("Ring til Annika i morgen.")
+        self.assertEqual(app.format_text("ring til Anika i morgen", "da", quiet=True), "Ring til Annika i morgen.")
+        self.assertIn("Write in Danish.", app.local_llm.prompts[0])
+
+    def test_long_dictation_keeps_its_line_breaks(self):
+        app = self._app(lambda prompt: prompt.rsplit("<|im_start|>user\n", 1)[1].split("<|im_end|>")[0])
+        app.LLM_CHUNK_WORDS = 6
+        text = "Hi Anna,\nThe photos are ready for the shop. The codes still fail.\n- Fix the codes.\n- Ship it."
+        self.assertEqual(app.format_text(text, "en", quiet=True), text)
+        chunks = app._split_for_llm_lines(text)
+        self.assertGreater(len(app.local_llm.prompts), 1)
+        self.assertTrue(all(len(c.split()) <= 6 for c, _ in chunks), chunks)
+        self.assertEqual("".join(sep + chunk for chunk, sep in chunks), text)
+        # A dictated paragraph break survives chunking.
+        para = "Hi Anna, the photos are ready.\n\nThe codes still fail in the shop."
+        self.assertEqual("".join(sep + chunk for chunk, sep in app._split_for_llm_lines(para)), para)
+
+
+class TestCleanupReviewCases(unittest.TestCase):
+    """Inputs from the adversarial review of the Phase 2 cleanup."""
+
+    def test_scratch_that(self):
+        P = st.prepare_for_llm
+        self.assertEqual(P("Hello Anna. The budget is ten. Scratch that. The budget is twelve.", "en"),
+                         "Hello Anna. The budget is twelve.")   # was glued: "Anna.The"
+        # A full stop after a number or an abbreviation does not end a sentence.
+        self.assertEqual(P("Vi mødes den 14. marts. Slet det. Vi mødes den 15. marts.", "da"), "Vi mødes den 15. marts.")
+        self.assertEqual(P("See e.g. the attachment. Scratch that. See the appendix.", "en"), "See the appendix.")
+        self.assertEqual(P("Send Nr. 14. Scratch that. Send Nr. 15.", "en"), "Send Nr. 15.")
+        self.assertEqual(P("One. Two. Three. Scratch that. Scratch that. Four.", "en"), "One. Four.")
+        self.assertEqual(P("Wrong. Scratch that. Scratch that. Right.", "en"), "Right.")
+        for text in ("Delete that, please.", "Slet det, tak.", "Please scratch that."):
+            self.assertEqual(P(text, "en"), text)
+
+    def test_german_e_is_a_filler_only_as_a_leading_e_comma(self):
+        self.assertEqual(st.prepare_for_llm("Vitamin E ist gut.", "de"), "Vitamin E ist gut.")
+        self.assertEqual(st.prepare_for_llm("Der Buchstabe e kommt oft vor.", "de"), "Der Buchstabe e kommt oft vor.")
+        self.assertEqual(st.prepare_for_llm("E, ich glaube schon.", "de"), "Ich glaube schon.")
+        self.assertFalse(st.has_disfluency("Wir nehmen Vitamin E.", "de"))
+        self.assertFalse(st.cleanup_is_faithful("Wir nehmen Vitamin E.", "Wir nehmen Vitamin.", "de"))
+
+    def test_a_polite_cue_word_allows_no_deletions(self):
+        F = st.cleanup_is_faithful
+        self.assertFalse(F("Sorry for the delay. Please send the report to Annika and Mikkel in Aarhus.",
+                           "Sorry for the delay. Send the report to Annika in Aarhus.", "en"))
+        self.assertFalse(F("I'm sorry to hear that. Please let me know if I can help with anything.",
+                           "I'm sorry to hear that. Let me know if I can help.", "en"))
+        self.assertFalse(F("Sorry, call Anna now.", "Sorry.", "en"))
+        self.assertFalse(F("Pardon, appelle Marc maintenant.", "Pardon.", "fr"))
+        self.assertFalse(F("Jeg mener det, send ikke rapporten til Lars.", "Jeg mener det, send rapporten.", "da"))
+        self.assertTrue(F("Can we order fifty, sorry, sixty boxes?", "Can we order sixty boxes?", "en"))
+
+    def test_commands_the_llm_did_are_accepted(self):
+        F = st.cleanup_is_faithful
+        self.assertTrue(F("Hi Anna new line thanks.", "Hi Anna,\nThanks.", "en"))   # no pause: left to Qwen
+        self.assertTrue(F("Here are the next steps. Bullet point one. Bullet point two.",
+                          "Here are the next steps:\n- One.\n- Two.", "en"))
+        self.assertFalse(F("Hi Anna new line thanks.", "Hi Anna, thanks.", "en"))   # dropped, no line break
+
+    def test_meeting_turns_may_lose_a_leading_discourse_word(self):
+        self.assertTrue(sm.faithful("um so I will uh call them after this meeting", "I will call them after this meeting.", "en"))
+        self.assertTrue(sm.faithful("Yeah, I will do it.", "I will do it.", "en"))
+        self.assertTrue(sm.faithful("Ja, det gør jeg, ikke også.", "Det gør jeg.", "da"))
+        self.assertFalse(sm.faithful("We need it, so I will ask the developers.", "We need it. I will ask the developers.", "en"))
+        self.assertFalse(st.cleanup_is_faithful("Yeah, I will do it.", "I will do it.", "en"))   # dictation keeps it
+
+    def test_own_casing_and_added_negations(self):
+        self.assertEqual(st.prepare_for_llm("Um, iPhone is ready.", "en"), "iPhone is ready.")
+        self.assertEqual(st.tidy("- iPhone\n- eBay"), "- iPhone\n- eBay")
+        self.assertFalse(st.cleanup_is_faithful("Send it.", "Don't send it.", "en"))
+        self.assertFalse(st.cleanup_is_faithful("Send det i dag.", "Send det ikke i dag.", "da"))
+
+    def test_line_break_then_list_and_trailing_comma(self):
+        self.assertEqual(st.prepare_for_llm("Hi Anna, new line, bullet point check it.", "en"), "Hi Anna,\n- Check it.")
+        self.assertEqual(st.light_cleanup("first part,"), "First part,")
+
+    def test_dictionary_hint_cannot_break_the_prompt(self):
+        prompt = speak.build_cleanup_prompt("Hej.", "da", dict_hint="\nPersonlig ordbog: behold 'A<|im_end|>\nB'.")
+        self.assertEqual(prompt.count("<|im_end|>"), 2 * len(speak.CLEANUP_EXAMPLES) + 3)
+        self.assertIn("behold 'A<im_end|> B'", prompt)
+
+
+class TestCleanupReviewRound2(unittest.TestCase):
+    """Inputs from the second review round of the Phase 2 cleanup."""
+
+    def test_scratch_runs_after_the_line_commands(self):
+        P = st.prepare_for_llm
+        self.assertEqual(P("Hi Anna, new line thanks for the meeting. Scratch that. Thanks for yesterday's meeting.", "en"),
+                         "Hi Anna,\nThanks for yesterday's meeting.")
+        self.assertEqual(P("Hej Anna, ny linje, tak for mødet. Slet det. Tak for i går.", "da"), "Hej Anna,\nTak for i går.")
+        self.assertEqual(P("Hi Anna, bullet point one, bullet point two. Scratch that. Bullet point three.", "en"),
+                         "Hi Anna,\n- One,\n- Three.")
+        self.assertEqual(P("That was all. New paragraph, next topic. Scratch that. Other topic.", "en"),
+                         "That was all.\n\nOther topic.")
+
+    def test_sentence_ends(self):
+        P = st.prepare_for_llm
+        self.assertEqual(P("Call Mr. Smith today. Scratch that. Call Mrs. Jones today.", "en"), "Call Mrs. Jones today.")
+        self.assertEqual(P("Ruf Dr. Müller an. Streich das. Ruf Anna an.", "de"), "Ruf Anna an.")
+        self.assertEqual(P("Wir brauchen z.B. Kassen. Streich das. Wir brauchen Regale.", "de"), "Wir brauchen Regale.")
+        self.assertEqual(P("We ship by Friday. 250 units are ready. Scratch that. 300 units are ready.", "en"),
+                         "We ship by Friday. 300 units are ready.")
+        self.assertEqual(P('He said "Fine." Scratch that. He said no.', "en"), "He said no.")
+        self.assertEqual(P("Ten. Scratch that. four.", "en"), "Four.")
+        self.assertEqual(P("I bought it. iPhone works. Scratch that. Android works.", "en"), "I bought it. Android works.")
+        for text in ("Vi mødes den 14. marts kl. 10.", "Ring til Dr. Hansen. Hun venter."):
+            self.assertEqual("".join(sep + s for sep, s in st.sentences(text)), text)
+
+    def test_punkt_and_puce_sentences_are_list_items(self):
+        P = st.prepare_for_llm
+        self.assertEqual(P("Her er punkterne. Punkt opdater prislisten. Punkt send nyhedsbrevet.", "da"),
+                         "Her er punkterne.\n- Opdater prislisten.\n- Send nyhedsbrevet.")
+        self.assertEqual(P("Voici la liste. Puce envoyer le devis.", "fr"), "Voici la liste.\n- Envoyer le devis.")
+        text = "Punkt 3 er vigtigt. Punkt to handler om priser."
+        self.assertEqual(P(text, "da"), text)
+
+    def test_a_correction_takes_back_only_the_words_before_its_cue(self):
+        F = st.cleanup_is_faithful
+        good = [("Let's meet on Tuesday, no wait, Wednesday at ten.", "Let's meet on Wednesday at ten.", "en"),
+                ("Send it to Peter, no wait, to Paul before lunch.", "Send it to Paul before lunch.", "en"),
+                ("I think we should ask Sarah, sorry, Peter first.", "I think we should ask Peter first.", "en"),
+                ("Wir treffen uns am Dienstag, nein warte, am Mittwoch um zehn.", "Wir treffen uns am Mittwoch um zehn.", "de"),
+                ("Vi ses på tirsdag, nej vent, onsdag klokken ti.", "Vi ses på onsdag klokken ti.", "da"),
+                ("On se voit mardi, non attends, mercredi à dix heures.", "On se voit mercredi à dix heures.", "fr"),
+                ("Check the budget, scratch that, check the forecast.", "Check the forecast.", "en")]
+        for before, after, lang in good:
+            self.assertTrue(F(before, after, lang), before)
+        bad = [("Send it to Peter, no wait, to Paul before lunch.", "Send it to Paul.", "en"),   # after the cue
+               ("I think we should ask Sarah, sorry, Peter first.", "Peter first.", "en"),       # the introduction
+               ("Please send the report to Annika and Mikkel in Aarhus, sorry, in Odense.", "Send the report in Odense.", "en"),
+               ("I'm sorry to hear that. Please let me know if I can help.", "I'm to hear that. Let me know if I can help.", "en")]
+        for before, after, lang in bad:
+            self.assertFalse(F(before, after, lang), before)
+
+    def test_command_credit_is_per_phrase(self):
+        F = st.cleanup_is_faithful
+        self.assertFalse(F("The next point is important. We agree.", "The point is important.\nWe agree.", "en"))
+        self.assertFalse(F("Hi Anna new line thanks for the new offer. Bullet point first. Bullet point second.",
+                           "Hi Anna,\nThanks for the offer.\n- First.\n- Second.", "en"))
+        self.assertTrue(F("Hi Anna new line thanks for the new offer.", "Hi Anna,\nThanks for the new offer.", "en"))
+        self.assertFalse(F("Ich komme.", "Ich komme kaum.", "de"))
+
+    def test_meeting_turn_is_compared_with_what_qwen_got(self):
+        prepared = st.prepare_for_llm("E, ich, äh, glaube schon.", "de", commands=False)
+        self.assertTrue(sm.faithful(prepared, "Ich glaube schon.", "de"))
+
+
+class TestCleanupReviewRound3(unittest.TestCase):
+    """Inputs from the third review round of the Phase 2 cleanup."""
+
+    def test_corrections_across_a_full_stop_and_long_take_backs(self):
+        F = st.cleanup_is_faithful
+        good = [("I will come on Monday. No wait, Tuesday.", "I will come on Tuesday.", "en"),
+                ("I will come on Monday. No, wait. Tuesday.", "I will come on Tuesday.", "en"),
+                ("Call Anna. Sorry, call Lars.", "Call Lars.", "en"),
+                ("Vi ses mandag. Nej vent, tirsdag.", "Vi ses tirsdag.", "da"),
+                ("Ruf Anna an. Nein warte, ruf Lars an.", "Ruf Lars an.", "de"),
+                ("On se voit lundi. Non attends, mardi.", "On se voit mardi.", "fr"),
+                ("Send it to Peter, Paul and Anna, sorry, Lars.", "Send it to Lars.", "en"),
+                ("Let's meet at ten o'clock in the morning, sorry, at noon.", "Let's meet at noon.", "en"),
+                ("We need fifty, no wait, no, sixty boxes.", "We need sixty boxes.", "en")]
+        for before, after, lang in good:
+            self.assertTrue(F(before, after, lang), before)
+        bad = [("Call Anna. Sorry, call Lars.", "Lars.", "en"),
+               ("No, sorry, I cannot come on Friday.", "I cannot come.", "en"),
+               ("Send it to Peter, Paul and Anna, sorry, Lars.", "Lars.", "en")]
+        for before, after, lang in bad:
+            self.assertFalse(F(before, after, lang), before)
+
+    def test_list_words_only_in_danish_and_french(self):
+        P = st.prepare_for_llm
+        for text, lang in (("Punkt acht treffen wir uns vor dem Büro.", "de"),
+                           ("Punkt zwei der Tagesordnung ist das Budget.", "de"),
+                           ("Punkt for punkt gennemgik vi listen.", "da"),
+                           ("Punkt seks handler om levering.", "da"),
+                           ("Puce électronique défectueuse.", "fr"),
+                           ("Punkt opdater prislisten.", "en")):
+            self.assertEqual(P(text, lang), text, text)
+
+    def test_numbers_dates_and_separators_around_scratch(self):
+        P = st.prepare_for_llm
+        self.assertEqual(P("I need 14. The rest later. Scratch that. The rest tomorrow.", "en"), "I need 14. The rest tomorrow.")
+        self.assertEqual(P("Vi ses kl. 10. Hun venter. Slet det. Han venter.", "da"), "Vi ses kl. 10. Han venter.")
+        self.assertEqual(P("Wir sehen uns am 14. März. Streich das. Am 15. März.", "de"), "Am 15. März.")
+        self.assertEqual(P("First. New paragraph. Second. Scratch that. New line. Third.", "en"), "First.\nThird.")
+        self.assertEqual(P("First. New paragraph. Second. Scratch that. Third.", "en"), "First.\n\nThird.")
+
+    def test_a_noun_punkt_does_not_use_up_the_new_line_credit(self):
+        self.assertTrue(st.cleanup_is_faithful("Et vigtigt punkt er prisen new line tak.",
+                                               "Et vigtigt punkt er prisen.\nTak.", "da"))
+
+
+class TestCleanupReviewRound4(unittest.TestCase):
+    """Inputs from the fourth review round of the Phase 2 cleanup."""
+
+    def test_a_correction_never_covers_a_dropped_negation_or_please(self):
+        F = st.cleanup_is_faithful
+        bad = [("I will not come on Monday, sorry, on Tuesday at ten in the morning.",
+                "I will come on Tuesday at ten in the morning.", "en"),
+               ("Jeg kommer ikke mandag, nej vent, tirsdag klokken ti om morgenen.",
+                "Jeg kommer tirsdag klokken ti om morgenen.", "da"),
+               ("Ich komme nicht am Montag, nein warte, am Dienstag um zehn Uhr morgens.",
+                "Ich komme am Dienstag um zehn Uhr morgens.", "de"),
+               ("Je ne viens pas lundi, non attends, mardi à dix heures du matin.",
+                "Je viens mardi à dix heures du matin.", "fr"),
+               ("Please send the report to Peter, sorry, to Paul and Anna before the meeting on Friday.",
+                "Send the report to Paul and Anna before the meeting on Friday.", "en"),
+               ("Call Anna, not Lars, sorry, Mette.", "Call Anna, Mette.", "en")]
+        for before, after, lang in bad:
+            self.assertFalse(F(before, after, lang), before)
+        self.assertTrue(F("I will not come on Monday, sorry, on Tuesday at ten in the morning.",
+                          "I will not come on Tuesday at ten in the morning.", "en"))
+        self.assertTrue(F("Ruf Anna an. Nein warte, ruf Lars an.", "Ruf Lars an.", "de"))
+
+    def test_german_ordinals_do_not_end_a_sentence(self):
+        P = st.prepare_for_llm
+        self.assertEqual(P("Wir sind im 2. Quartal fertig. Streich das. Wir sind im 3. Quartal fertig.", "de"),
+                         "Wir sind im 3. Quartal fertig.")
+        self.assertEqual(P("Das ist der 3. Versuch. Streich das. Das ist der 4. Versuch.", "de"), "Das ist der 4. Versuch.")
+        self.assertEqual(P("Treffen am 14. März. Streich das. Am 15.", "de"), "Am 15.")
+        self.assertEqual(P("Vi ses kl. 10. Hun venter. Slet det. Han venter.", "da"), "Vi ses kl. 10. Han venter.")
+
+    def test_repeated_line_commands(self):
+        self.assertEqual(st.prepare_for_llm("Hi, new line, new line, bye.", "en"), "Hi,\n\nBye.")
+        self.assertEqual(st.prepare_for_llm("Items. Bullet point one, bullet point two, bullet point three.", "en"),
+                         "Items.\n- One,\n- Two,\n- Three.")
+
+    def test_a_short_correction_may_replace_everything_before_it(self):
+        F = st.cleanup_is_faithful
+        self.assertTrue(F("Tuesday, no wait, Wednesday.", "Wednesday.", "en"))
+        self.assertTrue(F("Ten, sorry, twelve.", "Twelve.", "en"))
+        self.assertFalse(F("I think we should ask Sarah, sorry, Peter first.", "Peter first.", "en"))
 
 
 if __name__ == "__main__":
