@@ -6,6 +6,7 @@ Run with: python -m unittest test_speak.py
 import json
 import os
 import shutil
+import sys
 import tempfile
 import unittest
 
@@ -629,7 +630,7 @@ class TestMeetingEchoAndFidelity(unittest.TestCase):
         self.assertEqual(float(out[int(0.85 * sm.SAMPLE_RATE)]), 1.0)
         self.assertEqual(float(np.abs(out[int(0.9 * sm.SAMPLE_RATE):int(1.8 * sm.SAMPLE_RATE)]).max()), 0.0)
         self.assertEqual(float(out[int(1.85 * sm.SAMPLE_RATE)]), 1.0)
-        self.assertEqual(float(audio.min()), 1.0)   # input untouched
+        self.assertIs(out, audio)   # in place: no second copy of a long stream
 
     def test_drop_echo_words(self):
         system = [(10.0, 10.3, " Fixed", "en"), (10.4, 10.7, " by", "en"), (10.8, 11.2, " Thursday.", "en")]
@@ -1696,6 +1697,544 @@ class TestCleanupReviewRound4(unittest.TestCase):
         self.assertTrue(F("Tuesday, no wait, Wednesday.", "Wednesday.", "en"))
         self.assertTrue(F("Ten, sorry, twelve.", "Twelve.", "en"))
         self.assertFalse(F("I think we should ask Sarah, sorry, Peter first.", "Peter first.", "en"))
+
+
+class TestMeetingRecorderRecovers(unittest.TestCase):
+    """The recorder with fake audio libraries: a headset that drops and comes
+    back must leave both files on one timeline."""
+
+    def _fakes(self, events):
+        import threading
+        import types
+        import time as _time
+        state = {"system_opens": 0, "mic_opens": 0}
+
+        class Speaker:
+            def __init__(self, name):
+                self.name = name
+
+        class Recorder:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def record(self, numframes):
+                _time.sleep(numframes / 16000)
+                if state["system_opens"] == 1 and state.get("system_blocks", 0) >= 8:
+                    raise RuntimeError("device lost")   # the headset drops after 0.8 s
+                state["system_blocks"] = state.get("system_blocks", 0) + 1
+                return np.full((numframes, 1), 0.1, np.float32)
+
+        class Device:
+            def recorder(self, **kwargs):
+                state["system_opens"] += 1
+                if 2 <= state["system_opens"] <= 4:
+                    raise RuntimeError("no such device")   # gone for three retries
+                return Recorder()
+
+        def default_speaker():
+            return Speaker("Headset" if state["system_opens"] >= 4 else "Laptop speakers")
+
+        soundcard = types.SimpleNamespace(default_speaker=default_speaker, get_speaker=lambda name: Speaker(name),
+                                          get_microphone=lambda id, include_loopback: Device())
+
+        class InputStream:
+            def __init__(self, callback, **kwargs):
+                self.callback, self.running = callback, False
+                state["mic_opens"] += 1
+                self.number = state["mic_opens"]
+
+            def start(self):
+                self.running = True
+
+                def run():
+                    sent = 0
+                    while self.running:
+                        _time.sleep(0.05)
+                        if self.number == 1 and sent >= 12:
+                            continue   # the mic stops after 0.6 s; a reopened one works
+                        self.callback(np.full((800, 1), 0.2, np.float32), 800, None, None)
+                        sent += 1
+                threading.Thread(target=run, daemon=True).start()
+
+            def stop(self):
+                self.running = False
+
+            def close(self):
+                self.running = False
+
+        sounddevice = types.SimpleNamespace(InputStream=InputStream)
+        return soundcard, sounddevice, state
+
+    def test_both_streams_survive_a_dropped_headset(self):
+        import time as _time
+        from unittest import mock
+        soundcard, sounddevice, state = self._fakes([])
+        folder = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, folder, True)
+        logs = []
+        rec = sm.MeetingRecorder(folder, logs.append)
+        rec.SYSTEM_RETRY_SECONDS, rec.MIC_STALL_SECONDS, rec.GAP_SECONDS = 0.3, 0.5, 0.3
+        with mock.patch.dict(sys.modules, {"soundcard": soundcard, "sounddevice": sounddevice}):
+            rec.start()
+            _time.sleep(4.0)
+            meta = rec.stop()
+        mic, system = (sm.read_wav(os.path.join(folder, f"{n}.wav")) for n in ("mic", "system"))
+        for name, audio in (("mic", mic), ("system", system)):
+            clock = meta["clock"][name]
+            expected = clock["seconds"] * sm.SAMPLE_RATE + clock["first_frames"]
+            self.assertLess(abs(len(audio) - expected), 0.3 * sm.SAMPLE_RATE, (name, len(audio), expected))
+            self.assertTrue(meta["gaps"].get(name), (name, meta))   # the gap was filled with silence
+            self.assertGreater(float(np.mean(audio == 0)), 0.1, name)
+        self.assertLess(abs(len(mic) / sm.SAMPLE_RATE + meta["offsets"]["mic"]
+                            - len(system) / sm.SAMPLE_RATE - meta["offsets"]["system"]), 0.4)
+        self.assertEqual(meta["system_device"], "Headset")   # picked up the new default speaker
+        self.assertIsNone(meta["system_error"])
+        self.assertGreaterEqual(state["mic_opens"], 2)
+        joined = "\n".join(logs)
+        self.assertIn("System audio stopped", joined)
+        self.assertIn("System audio is back (Headset)", joined)
+        self.assertIn("microphone stopped", joined)
+        self.assertIn("microphone is back", joined)
+
+    def test_system_audio_that_never_works_is_reported(self):
+        import time as _time
+        import types
+        from unittest import mock
+        _, sounddevice, _ = self._fakes([])
+
+        def broken():
+            raise RuntimeError("no output device")
+        soundcard = types.SimpleNamespace(default_speaker=broken, get_speaker=lambda name: broken())
+        folder = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, folder, True)
+        logs = []
+        rec = sm.MeetingRecorder(folder, logs.append)
+        rec.SYSTEM_RETRY_SECONDS = 0.2
+        with mock.patch.dict(sys.modules, {"soundcard": soundcard, "sounddevice": sounddevice}):
+            rec.start()
+            _time.sleep(0.8)
+            meta = rec.stop()
+        self.assertEqual(meta["system_error"], "no output device")
+        self.assertNotIn("system", meta["clock"])
+        self.assertEqual(sum("cannot be recorded" in line for line in logs), 1)   # said once, not every retry
+
+
+class TestClockDrift(unittest.TestCase):
+    def test_a_drifting_stream_is_stretched_to_wall_clock(self):
+        sr = sm.SAMPLE_RATE
+        audio = np.zeros(100 * sr, np.float32)
+        audio[50 * sr] = 1.0   # a click at 50 s of device time
+        clock = {"seconds": 100.3 - 0.1, "first_frames": int(0.1 * sr)}   # the device clock was 3000 ppm slow
+        out = sm.correct_drift(audio, clock, chunk=7 * sr)   # chunks that do not divide the length
+        self.assertEqual(len(out), int(100.3 * sr))
+        self.assertAlmostEqual(int(np.argmax(out)) / sr, 50.15, delta=0.002)
+
+    def test_noise_and_implausible_drift_are_left_alone(self):
+        sr = sm.SAMPLE_RATE
+        audio = np.zeros(100 * sr, np.float32)
+        self.assertIs(sm.correct_drift(audio, {"seconds": 100.1, "first_frames": 0}), audio)   # < 0.2 s
+        self.assertIs(sm.correct_drift(audio, {"seconds": 1000.0, "first_frames": 0}), audio)  # the PC slept
+        self.assertIs(sm.correct_drift(audio, None), audio)                                     # old recordings
+
+    def test_load_streams_lines_up_the_clocks(self):
+        sr = sm.SAMPLE_RATE
+        folder = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, folder, True)
+        for name, seconds in (("mic", 120.0), ("system", 119.7)):
+            w = sm._WavWriter(os.path.join(folder, f"{name}.wav"))
+            w.write(np.zeros(int(seconds * sr), np.float32))
+            w.close()
+        meta = {"offsets": {"mic": 0.0, "system": 0.5},
+                "clock": {"mic": {"seconds": 120.0, "first_frames": 0, "frames": 120 * sr},
+                          "system": {"seconds": 120.0, "first_frames": 0, "frames": int(119.7 * sr)}}}
+        with open(os.path.join(folder, "meeting.json"), "w", encoding="utf-8") as f:
+            json.dump(meta, f)
+        manager = sm.MeetingManager.__new__(sm.MeetingManager)
+        manager.log, manager.recordings_dir = (lambda *a: None), tempfile.gettempdir()
+        streams, _, _ = manager._load_streams(folder)
+        lengths = {name: len(audio) / sr for name, audio in streams}
+        self.assertAlmostEqual(lengths["mic"], 120.0, places=2)
+        self.assertAlmostEqual(lengths["system"], 120.5, places=2)   # stretched to 120 s, after its 0.5 s offset
+
+
+class TestMeetingMinutesCues(unittest.TestCase):
+    def test_present_tense_promises_and_habits(self):
+        kinds = lambda text: [k for k, _ in sm.split_clauses(text)]
+        for text in ("Jeg tjekker det i morgen.", "Jeg kigger på tilbuddet.", "Det tager jeg.",
+                     "Jeg sørger for at butikkerne får besked.", "Ich kümmere mich darum.",
+                     "Je m'en charge.", "Leave it with me.", "I'm on it."):
+            self.assertEqual(kinds(text), ["promise"], text)
+        for text in ("Jeg tjekker altid mails om morgenen.", "I always check the numbers on Monday.",
+                     "Ich schaue immer zuerst in den Kalender."):
+            self.assertEqual(kinds(text), [], text)
+
+    def test_short_words_count_for_grounding(self):
+        self.assertTrue(sm.grounded("Fix the bug", "Okay, I will fix the bug today."))
+        self.assertTrue(sm.grounded("Book møde i maj", "Jeg booker et møde i maj."))
+        self.assertFalse(sm.grounded("Send the numbers", "Yes, the one for you."))   # only stop words shared
+
+    def test_a_hyphenated_name_is_a_faithful_cleanup(self):
+        self.assertTrue(sm.faithful("Mette Kristine sender det i morgen.", "Mette-Kristine sender det i morgen.", "da"))
+
+
+class TestMeetingRecorderReviewCases(unittest.TestCase):
+    """Inputs from the adversarial review of the Phase 3 recorder."""
+
+    def _recorder(self, **attrs):
+        folder = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, folder, True)
+        logs = []
+        rec = sm.MeetingRecorder(folder, logs.append)
+        for k, v in attrs.items():
+            setattr(rec, k, v)
+        return rec, logs
+
+    @staticmethod
+    def _sounddevice(open_seconds=0.0, deliver=lambda number: False):
+        import threading
+        import time as _time
+        import types
+        streams = []
+
+        class InputStream:
+            def __init__(self, callback, **kwargs):
+                _time.sleep(open_seconds if streams else 0.0)   # reopening a Bluetooth device is slow
+                self.callback, self.running, self.closed = callback, False, False
+                streams.append(self)
+
+            def start(self):
+                self.running = True
+                number = len(streams)
+
+                def run():
+                    while self.running:
+                        _time.sleep(0.05)
+                        if self.running and deliver(number):
+                            self.callback(np.zeros((800, 1), np.float32), 800, None, None)
+                threading.Thread(target=run, daemon=True).start()
+
+            def stop(self):
+                self.running = False
+
+            def close(self):
+                self.running, self.closed = False, True
+
+        return types.SimpleNamespace(InputStream=InputStream), streams
+
+    @staticmethod
+    def _soundcard(names):
+        """names(): the current default speaker name."""
+        import time as _time
+        import types
+
+        class Recorder:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def record(self, numframes):
+                _time.sleep(numframes / 16000)
+                return np.zeros((numframes, 1), np.float32)
+
+        speaker = lambda: types.SimpleNamespace(name=names())
+        device = types.SimpleNamespace(recorder=lambda **kw: Recorder())
+        return types.SimpleNamespace(default_speaker=speaker, get_speaker=lambda n: speaker(),
+                                     get_microphone=lambda id, include_loopback: device)
+
+    def test_stop_during_a_slow_mic_reopen_leaves_no_stream_open(self):
+        import time as _time
+        from unittest import mock
+        sd, streams = self._sounddevice(open_seconds=0.4)   # a dead mic, slow to reopen
+        rec, _ = self._recorder(MIC_STALL_SECONDS=0.2)
+        with mock.patch.dict(sys.modules, {"sounddevice": sd, "soundcard": self._soundcard(lambda: "Speakers")}):
+            rec.start()
+            deadline = _time.monotonic() + 5
+            while len(streams) < 2 and _time.monotonic() < deadline:
+                _time.sleep(0.01)   # until the reopen has started
+            _time.sleep(0.05)
+            rec.stop()
+            _time.sleep(0.6)    # let a reopen that was in flight finish
+        self.assertGreaterEqual(len(streams), 2)
+        self.assertTrue(all(s.closed or not s.running for s in streams), [(s.running, s.closed) for s in streams])
+        self.assertIsNone(rec.mic_stream)
+
+    def test_a_dead_mic_does_not_keep_the_meeting_past_its_limit(self):
+        import threading
+        import time as _time
+        from unittest import mock
+        sd, _ = self._sounddevice()
+        fired = threading.Event()
+        rec, _ = self._recorder(max_seconds=0.5, on_limit=fired.set)
+        with mock.patch.dict(sys.modules, {"sounddevice": sd, "soundcard": self._soundcard(lambda: "Speakers")}):
+            rec.start()
+            self.assertTrue(fired.wait(3))
+            rec.stop()
+
+    def test_system_audio_follows_a_new_default_speaker(self):
+        import time as _time
+        from unittest import mock
+        t0 = _time.monotonic()
+        names = lambda: "Headset" if _time.monotonic() - t0 < 0.8 else "Laptop speakers"
+        sd, _ = self._sounddevice(deliver=lambda n: True)
+        rec, logs = self._recorder(SPEAKER_CHECK_SECONDS=0.2)
+        with mock.patch.dict(sys.modules, {"sounddevice": sd, "soundcard": self._soundcard(names)}):
+            rec.start()
+            _time.sleep(1.6)
+            meta = rec.stop()
+        self.assertEqual(meta["system_device"], "Laptop speakers")
+        self.assertTrue(any("now comes from Laptop speakers" in line for line in logs), logs)
+        clock = meta["clock"]["system"]
+        self.assertLess(abs(clock["frames"] - clock["seconds"] * sm.SAMPLE_RATE - clock["first_frames"]),
+                        0.3 * sm.SAMPLE_RATE)   # the switch did not cost the timeline
+
+    def test_an_unfilled_gap_does_not_count_as_clock_drift(self):
+        import datetime
+        rec, _ = self._recorder(MAX_GAP_SECONDS=2)
+        rec._t0, rec.started = 0.0, datetime.datetime.now()
+        rec.mic_writer = sm._WavWriter(os.path.join(rec.folder, "mic.wav"))
+        rec.system_writer = sm._WavWriter(os.path.join(rec.folder, "system.wav"))
+        block = np.zeros(1600, np.float32)
+        t = 0.1
+        for _ in range(50):
+            rec._write("system", rec.system_writer, block, t)
+            t += 0.1
+        t += 10.0   # the PC slept 10 s; only 2 s are filled
+        for _ in range(50):
+            rec._write("system", rec.system_writer, block, t)
+            t += 0.1
+        meta = rec.stop()
+        clock = meta["clock"]["system"]
+        self.assertAlmostEqual(clock["frames"] / sm.SAMPLE_RATE, clock["seconds"] + clock["first_frames"] / sm.SAMPLE_RATE,
+                               delta=0.15)
+        audio = np.zeros(clock["frames"], np.float32)
+        self.assertIs(sm.correct_drift(audio, clock), audio)   # nothing to stretch
+        self.assertEqual(meta["gaps"]["system"], [[5.0, 2.0]])
+
+    def test_dropouts_are_noted_in_the_transcript(self):
+        notes = sm.gap_notes({"gaps": {"system": [[754.0, 21.0], [900.0, 1.5]], "mic": [[60.0, 4.0]]}})
+        self.assertEqual(len(notes), 2)
+        self.assertIn("The call audio dropped out during the recording, at 00:12:34 (21 s)", notes[0])
+        self.assertNotIn("00:15:00", notes[0])   # under 3 s is no dropout worth a note
+        self.assertIn("The microphone dropped out", notes[1])
+        self.assertEqual(sm.gap_notes({}), [])
+
+
+class TestMeetingMinutesReviewCases(unittest.TestCase):
+    def test_habit_words_only_in_the_promise_clause(self):
+        kinds = lambda text: [k for k, _ in sm.split_clauses(text)]
+        for text in ("Jeg tjekker det hver uge, men jeg sender rapporten i morgen.",
+                     "Normally I would, but I will send it tomorrow.",
+                     "I'll check it, I usually do that on Mondays anyway.",
+                     "I will send it every week from now on.", "Jeg sender det hver uge fra nu af.",
+                     "Ich kümmere mich immer noch darum.", "Je m'en occupe toujours."):
+            self.assertEqual(kinds(text), ["promise"], text)
+        self.assertEqual(kinds("Jeg tjekker altid mails om morgenen."), [])
+
+    def test_refusals_and_opinions_are_no_promises(self):
+        kinds = lambda text: [k for k, _ in sm.split_clauses(text)]
+        for text in ("Det gør jeg ikke.", "Det gør jeg ikke, det er for dyrt.", "Jeg tjekker det aldrig.",
+                     "I will not do that.", "Ich mache das nicht.", "Jeg finder det svært at tro.",
+                     "Jeg hører hvad du siger.", "Jeg laver bare sjov."):
+            self.assertEqual(kinds(text), [], text)
+        self.assertEqual(kinds("I'll send it, not the old one, the new one."), ["promise"])
+
+    def test_a_refusal_does_not_make_an_owner(self):
+        turns = [{"label": "A", "text": "Kan du ringe til kunden?"},
+                 {"label": "B", "text": "Det gør jeg ikke, det er din kunde."}]
+        self.assertIsNone(sm.agreed_by_next(turns, 0))
+        turns[1]["text"] = "Det gør jeg i morgen."
+        self.assertEqual(sm.agreed_by_next(turns, 0), "B")
+
+
+class TestMeetingReviewRound2(unittest.TestCase):
+    """Inputs from the second review round of Phase 3."""
+
+    def test_cant_is_a_refusal(self):
+        kinds = lambda text: [k for k, _ in sm.split_clauses(text)]
+        for text in ("I can't send it today.", "I can't, sorry.", "I can't make it before Friday."):
+            self.assertEqual(kinds(text), [], text)
+        for answer in ("I can't, sorry.", "I can't make it today, no.", "Ja, det gør jeg ikke."):
+            turns = [{"label": "A", "text": "Can you send the report today?"}, {"label": "B", "text": answer}]
+            self.assertIsNone(sm.agreed_by_next(turns, 0), answer)
+
+    def test_negation_inside_what_is_promised(self):
+        kinds = lambda text: [k for k, _ in sm.split_clauses(text)]
+        self.assertEqual(kinds("Jeg sørger for at det ikke sker igen."), ["promise"])
+        self.assertEqual(kinds("I'll make sure that it does not happen again."), ["promise"])
+        self.assertEqual(kinds("I will send it every day until it is fixed."), ["promise"])
+        self.assertEqual(kinds("Ich schicke es dir jeden Tag bis es läuft."), ["promise"])
+
+    def test_a_short_reopen_is_filled_exactly(self):
+        import datetime
+        rec = sm.MeetingRecorder(tempfile.mkdtemp(), lambda *a: None)
+        self.addCleanup(shutil.rmtree, rec.folder, True)
+        rec._t0, rec.started = 0.0, datetime.datetime.now()
+        rec.mic_writer = sm._WavWriter(os.path.join(rec.folder, "mic.wav"))
+        rec.system_writer = sm._WavWriter(os.path.join(rec.folder, "system.wav"))
+        block = np.zeros(1600, np.float32)
+        t = 0.1
+        for switch in range(4):
+            if switch:
+                rec._reopened["system"] = t   # a device switch: 0.3 s, under GAP_SECONDS
+                t += 0.3
+            for _ in range(20):
+                rec._write("system", rec.system_writer, block, t)
+                t += 0.1
+        meta = rec.stop()
+        clock = meta["clock"]["system"]
+        self.assertAlmostEqual(clock["frames"] / sm.SAMPLE_RATE, clock["seconds"] + clock["first_frames"] / sm.SAMPLE_RATE,
+                               delta=0.01)   # 0.9 s of switches filled: nothing left for the drift correction
+        self.assertEqual(len(meta["gaps"]["system"]), 3)
+
+    def test_jitter_after_the_first_open_adds_no_silence(self):
+        rec = sm.MeetingRecorder(tempfile.mkdtemp(), lambda *a: None)
+        self.addCleanup(shutil.rmtree, rec.folder, True)
+        rec._t0 = 0.0
+        writer = sm._WavWriter(os.path.join(rec.folder, "system.wav"))
+        rec._reopened["system"] = 0.0   # set when the device first opens
+        block = np.zeros(1600, np.float32)
+        rec._write("system", writer, block, 0.1)
+        rec._write("system", writer, block, 0.205)   # 5 ms late: normal jitter
+        writer.close()
+        self.assertEqual(writer.frames, 3200)
+
+    def test_the_configured_speaker_is_used_again_when_it_is_back(self):
+        import time as _time
+        import types
+        from unittest import mock
+        t0 = _time.monotonic()
+        opened = []
+
+        class Recorder:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def record(self, numframes):
+                _time.sleep(numframes / 16000)
+                if opened[-1] == "Headset" and len(opened) == 1 and _time.monotonic() - t0 > 0.4:
+                    raise RuntimeError("device lost")
+                return np.zeros((numframes, 1), np.float32)
+
+        def get_speaker(name):
+            if 0.4 < _time.monotonic() - t0 < 1.0:
+                raise IndexError("no such speaker")   # the headset is gone for a moment
+            return types.SimpleNamespace(name="Headset")
+
+        def get_microphone(id, include_loopback):
+            return types.SimpleNamespace(recorder=lambda **kw: opened.append(id) or Recorder())
+
+        soundcard = types.SimpleNamespace(get_speaker=get_speaker, get_microphone=get_microphone,
+                                          default_speaker=lambda: types.SimpleNamespace(name="Laptop speakers"))
+        sd, _ = TestMeetingRecorderReviewCases._sounddevice(deliver=lambda n: True)
+        rec = sm.MeetingRecorder(tempfile.mkdtemp(), lambda *a: None, speaker="Headset")
+        self.addCleanup(shutil.rmtree, rec.folder, True)
+        rec.SYSTEM_RETRY_SECONDS, rec.SPEAKER_CHECK_SECONDS = 0.1, 0.2
+        with mock.patch.dict(sys.modules, {"soundcard": soundcard, "sounddevice": sd}):
+            rec.start()
+            _time.sleep(2.0)
+            meta = rec.stop()
+        self.assertEqual(opened[:2], ["Headset", "Laptop speakers"])
+        self.assertEqual(meta["system_device"], "Headset")   # back on the configured speaker
+
+    def test_a_mic_opened_outside_the_lock_is_still_closed_on_stop(self):
+        import time as _time
+        from unittest import mock
+        sd, streams = TestMeetingRecorderReviewCases._sounddevice(open_seconds=2.0)
+        rec = sm.MeetingRecorder(tempfile.mkdtemp(), lambda *a: None)
+        self.addCleanup(shutil.rmtree, rec.folder, True)
+        rec.MIC_STALL_SECONDS = 0.2
+        soundcard = TestMeetingRecorderReviewCases._soundcard(lambda: "Speakers")
+        with mock.patch.dict(sys.modules, {"sounddevice": sd, "soundcard": soundcard}):
+            rec.start()
+            _time.sleep(0.9)   # the reopen is now inside its 2 s open
+            rec.stop()
+            _time.sleep(2.2)
+        self.assertTrue(all(s.closed or not s.running for s in streams))
+
+
+class TestMeetingReviewRound3(unittest.TestCase):
+    """Inputs from the third review round of Phase 3."""
+
+    def test_a_refusal_then_a_promise_still_has_an_owner(self):
+        for answer in ("Yes, but I can't today, I'll send it tomorrow.", "I can't today. I'll send it tomorrow.",
+                       "Ja, men jeg kan ikke i dag, jeg sender den i morgen."):
+            turns = [{"label": "A", "text": "Can you send the report today?"}, {"label": "B", "text": answer}]
+            self.assertEqual(sm.agreed_by_next(turns, 0), "B", answer)
+
+    def test_a_deadline_does_not_turn_a_habit_into_a_promise(self):
+        kinds = lambda text: [k for k, _ in sm.split_clauses(text)]
+        for text in ("Ich prüfe das normalerweise bis Mittwoch.", "Ich mache das immer bis Freitag.",
+                     "Jeg tjekker altid indtil klokken fem.", "Je vérifie d'habitude jusqu'au vendredi."):
+            self.assertEqual(kinds(text), [], text)
+        self.assertEqual(kinds("I will send it every day until it is fixed."), ["promise"])
+        self.assertEqual(kinds("I will always send it by Friday from now on."), ["promise"])
+
+    def test_typographic_apostrophes(self):
+        kinds = lambda text: [k for k, _ in sm.split_clauses(text)]
+        self.assertEqual(kinds("I can\u2019t send it today."), [])
+        self.assertEqual(kinds("I\u2019ll send it tomorrow."), ["promise"])
+        self.assertEqual(sm.split_clauses("I\u2019ll send it tomorrow.")[0][1], "I\u2019ll send it tomorrow.")
+
+    def test_a_late_block_of_the_old_stream_does_not_use_up_the_reopen(self):
+        rec = sm.MeetingRecorder(tempfile.mkdtemp(), lambda *a: None)
+        self.addCleanup(shutil.rmtree, rec.folder, True)
+        rec._t0 = 0.0
+        writer = sm._WavWriter(os.path.join(rec.folder, "mic.wav"))
+        block = np.zeros(800, np.float32)   # 50 ms blocks
+        rec._write("mic", writer, block, 10.05)
+        rec._write("mic", writer, block, 10.10)
+        rec._reopened["mic"] = 12.65              # the stall reopen
+        rec._write("mic", writer, block, 12.60)   # the old stream's delayed block (GIL pause)
+        rec._write("mic", writer, block, 12.95)   # the new stream's first block, 0.3 s later
+        writer.close()
+        expected = (12.95 - 10.05) * sm.SAMPLE_RATE + 800
+        self.assertLess(abs(writer.frames - expected), 2, (writer.frames, expected))
+
+
+class TestMeetingReviewRound4(unittest.TestCase):
+    """Inputs from the fourth review round of Phase 3."""
+
+    def test_a_bare_no_then_a_promise_has_an_owner(self):
+        for answer, owner in (("No. I'll send it tomorrow.", "B"), ("Nej. Jeg sender den i morgen.", "B"),
+                              ("No.", None), ("No, I can't. Peter, can you?", None)):
+            turns = [{"label": "A", "text": "Can you send the report today?"}, {"label": "B", "text": answer}]
+            self.assertEqual(sm.agreed_by_next(turns, 0), owner, answer)
+
+    def test_a_fast_first_callback_after_a_reopen_is_filled(self):
+        rec = sm.MeetingRecorder(tempfile.mkdtemp(), lambda *a: None)
+        self.addCleanup(shutil.rmtree, rec.folder, True)
+        rec._t0 = 0.0
+        writer = sm._WavWriter(os.path.join(rec.folder, "mic.wav"))
+        block = np.zeros(800, np.float32)
+        rec._write("mic", writer, block, 10.05)
+        rec._write("mic", writer, block, 10.10)
+        rec._reopened["mic"] = 10.12              # taken when the old stream closed
+        rec._write("mic", writer, block, 10.45)   # the new stream's first block, before the reopen returned
+        rec._write("mic", writer, block, 10.50)
+        writer.close()
+        self.assertLess(abs(writer.frames - ((10.50 - 10.05) * sm.SAMPLE_RATE + 800)), 2)
+        self.assertEqual(len(rec.gaps["mic"]), 1)
+
+    def test_no_zero_length_gap_rows(self):
+        rec = sm.MeetingRecorder(tempfile.mkdtemp(), lambda *a: None)
+        self.addCleanup(shutil.rmtree, rec.folder, True)
+        rec._t0 = 0.0
+        writer = sm._WavWriter(os.path.join(rec.folder, "mic.wav"))
+        block = np.zeros(800, np.float32)
+        rec._write("mic", writer, block, 10.05)
+        rec._reopened["mic"] = 10.06
+        rec._write("mic", writer, block, 10.1000001)   # a few microseconds late: float noise
+        writer.close()
+        self.assertEqual(rec.gaps["mic"], [])
+        self.assertEqual(writer.frames, 1600)
 
 
 if __name__ == "__main__":

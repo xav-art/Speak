@@ -377,10 +377,53 @@ Answer: {"keep": false, "text": "", "due": ""}"""
 
 _REQUEST = re.compile(r"\b(can you|could you|would you|please|kan du|vil du|kunne du|kannst du|könntest du|"
                       r"bitte|peux-tu|pouvez-vous|pourrais-tu|s'il te plaît|s'il vous plaît)\b", re.IGNORECASE)
-_COMMIT = re.compile(r"\b(i will|i'll|i can|i am going to|i'm going to|let me|"
+_COMMIT = re.compile(r"\b(i will|i'll|i can|i am going to|i'm going to|let me|i'm on it|leave it with me|"
+                     r"i can take that|"
                      r"jeg vil|jeg skal|jeg kan|jeg giver|jeg sender|jeg tager|jeg ringer|"
-                     r"ich werde|ich kann|ich mache|ich schicke|ich rufe|je vais|je peux|je m'en occupe)\b",
+                     # Danish promises are mostly said in the present tense.
+                     r"jeg tjekker|jeg kigger|jeg skriver|jeg opretter|jeg fikser|jeg booker|"
+                     r"jeg opdaterer|jeg følger op|jeg sørger for|jeg retter|"
+                     r"jeg undersøger|jeg vender tilbage|det tager jeg|det gør jeg|det klarer jeg|"
+                     r"ich werde|ich kann|ich mache|ich schicke|ich rufe|ich kümmere mich|ich prüfe|ich kläre|"
+                     r"ich schaue|ich melde mich|ich übernehme|das mache ich|"
+                     r"je vais|je peux|je m'en occupe|je m'en charge|je vérifie|je regarde|je reviens vers)\b",
                      re.IGNORECASE)
+# "Jeg tjekker altid mails" is a habit, not a promise, when the habit word is
+# in the promise's own clause ("Jeg tjekker det hver uge, men jeg sender
+# rapporten i morgen" still promises the report). "Immer noch" is "still".
+_HABIT_ADVERB = re.compile(r"\b(altid|plejer|normalt|always|usually|normally|immer(?! noch)|normalerweise|"
+                           r"d'habitude)\b", re.IGNORECASE)
+_HABIT_FREQUENCY = re.compile(r"\b(hver dag|hver uge|every day|every week|jeden tag|jede woche|tous les jours|"
+                              r"chaque semaine)\b", re.IGNORECASE)
+# A promise that recurs: "... every week from now on", and, for a frequency
+# only, "... every day until it is fixed" ("Ich mache das immer bis Freitag"
+# is still a habit: "bis" is in most German deadlines).
+_FROM_NOW = re.compile(r"\b(from now on|fra nu af|fremover|ab jetzt|von nun an|désormais|à partir de maintenant)\b",
+                       re.IGNORECASE)
+_UNTIL = re.compile(r"\b(until|till|indtil|bis|jusqu'à|jusqu'au)\b", re.IGNORECASE)
+# "Det gør jeg ikke", "Jeg tjekker det aldrig", "I can't": a refusal, not a
+# promise. A negation after "at", "that", "dass" or "que" belongs to what is
+# promised: "Jeg sørger for at det ikke sker igen".
+_REFUSAL = re.compile(r"^(?:n?'t\b|\s*(?:(?!(?:at|that|dass|que|qu'il)\b)[\w']+\s+){0,2}?"
+                      r"(ikke|aldrig|not|never|nicht|nie|pas|jamais)\b)", re.IGNORECASE)
+
+
+def _plain_quotes(text):
+    return text.replace("\u2019", "'").replace("\u2018", "'")
+
+
+def _is_promise(text, end):
+    """Whether the promise cue that ends at `end` really promises: no
+    negation right after it, and no habit word in its clause."""
+    after = text[end:]
+    if _REFUSAL.search(after):
+        return False
+    clause = re.split(r"[,;.!?]", after, maxsplit=1)[0]
+    if _FROM_NOW.search(clause):
+        return True
+    if _HABIT_ADVERB.search(clause):
+        return False
+    return not _HABIT_FREQUENCY.search(clause) or bool(_UNTIL.search(clause))
 _DECIDE = re.compile(r"\b(let us|let's|we will|we'll|we should|we need to|we agreed|agreed|decided|"
                      r"lad os|vi skal|vi gør|vi er enige|enige|besluttet|"
                      r"lass uns|wir werden|wir sollten|einverstanden|beschlossen|"
@@ -394,14 +437,17 @@ def split_clauses(text):
     starts at its sentence start (or at its cue when an earlier cue already
     took that sentence) and ends at the end of the cue's sentence or where the
     next clause starts, whichever comes first."""
+    plain = _plain_quotes(text)   # "I can’t", "I’ll": same length, so the offsets fit the text
     hits = sorted((m.start(), m.end(), kind) for rx, kind in
-                  ((_COMMIT, "promise"), (_REQUEST, "request"), (_DECIDE, "decision")) for m in rx.finditer(text))
+                  ((_COMMIT, "promise"), (_REQUEST, "request"), (_DECIDE, "decision")) for m in rx.finditer(plain))
     clauses, last_end = [], -1
     for pos, end, kind in hits:
         if pos < last_end:
             continue    # "we agreed" also contains "agreed"
-        last_end = end
         sentence = max((m.end() for m in re.finditer(r"[.!?]\s+", text[:pos])), default=0)
+        if kind == "promise" and not _is_promise(plain, end):
+            continue
+        last_end = end
         start = sentence if not clauses or sentence > clauses[-1][0] else pos
         stop = re.search(r"[.!?](\s|$)", text[end:])
         clauses.append([start, end + stop.end() if stop else len(text), kind])
@@ -442,8 +488,22 @@ def context_for(turns, i, clause):
     return "\n".join(lines)
 
 
+# Three-letter words that say nothing about a task. "maj", "uge", "bug" and
+# "fix" do: before, every word under four letters was ignored, so "Fix the
+# bug" matched nothing and was dropped as ungrounded.
+_SHORT_STOP = {"the", "and", "for", "you", "are", "was", "but", "not", "can", "all", "our", "has", "had", "its",
+               "his", "her", "him", "she", "who", "why", "how", "yes", "now", "too", "any", "get", "got", "let",
+               "see", "det", "den", "der", "som", "med", "har", "var", "kan", "vil", "jeg", "han", "hun", "men",
+               "til", "fra", "nej", "mig", "dig", "sig", "dem", "alt", "ham", "sin", "sit", "man", "når", "her",
+               "nok", "lad", "får", "bør", "und", "die", "das", "ich", "sie", "wir", "ihr", "ist", "mit", "von",
+               "aus", "auf", "bei", "dem", "des", "ein", "wie", "was", "wer", "nur", "mal", "gut", "uns", "zum",
+               "zur", "les", "une", "est", "pas", "qui", "que", "par", "sur", "ils", "mes", "tes", "ses", "ton",
+               "son", "mon", "toi", "moi", "ont", "été", "oui", "non", "bon"} | _AGREE
+
+
 def _stems(text):
-    return {w[:5] for w in (_norm_word(x) for x in text.split()) if len(w) >= 4}
+    words = (_norm_word(x) for x in text.split())
+    return {w[:5] for w in words if len(w) >= 4 or (len(w) == 3 and w not in _SHORT_STOP)}
 
 
 def grounded(item_text, source_text):
@@ -452,11 +512,27 @@ def grounded(item_text, source_text):
     return bool(_stems(item_text) & _stems(source_text))
 
 
+_DECLINE = {"no", "nope", "nej", "nein", "non"}
+
+
 def agreed_by_next(turns, i):
     """The next speaker if they answer turn i with a yes, else None."""
     nxt = turns[i + 1] if i + 1 < len(turns) else None
     if nxt and nxt["label"] != turns[i]["label"] and nxt["text"].split():
-        if _norm_word(nxt["text"].split()[0]) in _AGREE or _COMMIT.match(nxt["text"]):
+        text = _plain_quotes(nxt["text"])
+        parts = re.split(r"(?<=[.!?])\s+", text)
+
+        def cues_in(k):   # one bool per cue in sentence k: does it promise?
+            return [_is_promise(parts[k], c.end()) for c in _COMMIT.finditer(parts[k])] if k < len(parts) else []
+
+        first = cues_in(0)
+        if any(first):
+            return nxt["label"]   # "I will", "Yes, but I can't today, I'll send it tomorrow"
+        if first or _norm_word(parts[0].split()[0]) in _DECLINE:
+            # "(Ja,) det gør jeg ikke": turned down, unless the next sentence
+            # promises after all ("I can't today. I'll send it tomorrow.").
+            return nxt["label"] if any(cues_in(1)) else None
+        if _norm_word(text.split()[0]) in _AGREE:
             return nxt["label"]
     return None
 
@@ -552,12 +628,25 @@ def echo_correlation(mic, system, segments, frame=400, max_lag_frames=12):
     return best
 
 
+def gap_notes(meta):
+    """Transcript notes for device dropouts of 3 s or more (meeting.json
+    "gaps"): the minutes may miss what was said then."""
+    notes = []
+    for name, what in (("system", "The call audio"), ("mic", "The microphone")):
+        gaps = [g for g in (meta.get("gaps") or {}).get(name, []) if g[1] >= 3]
+        if gaps:
+            when = ", ".join(f"{format_timestamp(g[0])} ({g[1]:.0f} s)" for g in gaps[:5])
+            notes.append(f"{what} dropped out during the recording, at {when}"
+                         f"{' and more' if len(gaps) > 5 else ''}: what was said then may be missing.")
+    return notes
+
+
 def mute_segments(audio, segments, before=0.1, after=0.3):
-    """Silences the given time ranges (padded for the speaker-to-mic delay)."""
-    out = audio.copy()
+    """Silences the given time ranges (padded for the speaker-to-mic delay),
+    in place: a copy of a 4-hour stream costs about 900 MB."""
     for s in segments:
-        out[max(0, int((s[0] - before) * SAMPLE_RATE)):int((s[1] + after) * SAMPLE_RATE)] = 0.0
-    return out
+        audio[max(0, int((s[0] - before) * SAMPLE_RATE)):int((s[1] + after) * SAMPLE_RATE)] = 0.0
+    return audio
 
 
 def drop_echo_words(mic_words, system_words, window=0.6):
@@ -618,6 +707,36 @@ def read_wav(path):
     return audio
 
 
+DRIFT_MIN_SECONDS = 0.2    # less is block-timing noise
+DRIFT_MAX_RATIO = 0.005    # more is no clock drift (0.005 % to 0.1 % is): the PC slept, say
+
+
+def correct_drift(audio, clock, chunk=SAMPLE_RATE * 60):
+    """Stretches a stream to the wall-clock length it was recorded over.
+
+    The mic and the system audio run on different hardware clocks, which
+    drift apart by 0.2 to 0.7 s per hour; on a long meeting that breaks echo
+    removal (it looks 300 ms apart at most) and the order of turns. clock is
+    the recorder's {"seconds", "first_frames", "frames"} for the stream.
+    Linear interpolation, a minute at a time, so a 4-hour stream needs no
+    full-length index arrays."""
+    if not clock or not len(audio):
+        return audio
+    n = len(audio)
+    target = int(round(clock["seconds"] * SAMPLE_RATE)) + int(clock.get("first_frames", 0))
+    if abs(target - n) < DRIFT_MIN_SECONDS * SAMPLE_RATE or abs(target - n) > DRIFT_MAX_RATIO * n or target < 2:
+        return audio
+    out = np.empty(target, np.float32)
+    step = (n - 1) / (target - 1)
+    for s in range(0, target, chunk):
+        pos = np.arange(s, min(target, s + chunk), dtype=np.float64) * step
+        i0 = pos.astype(np.int64)
+        i1 = np.minimum(i0 + 1, n - 1)
+        frac = (pos - i0).astype(np.float32)
+        out[s:s + len(pos)] = audio[i0] * (1 - frac) + audio[i1] * frac
+    return out
+
+
 class _WavWriter:
     def __init__(self, path):
         self.w = wave.open(path, "wb")
@@ -638,13 +757,33 @@ class _WavWriter:
             pass
 
 
+def _device_id(device):
+    """soundcard's endpoint id: unique where names are not ("Headset" can be
+    the stereo and the hands-free endpoint of one Bluetooth headset)."""
+    return getattr(device, "id", None) or device.name
+
+
 class MeetingRecorder:
     """Records the mic and the system audio side by side into a folder.
 
     The mic uses sounddevice (same as dictation). System audio uses the soundcard
     library, because sounddevice's PortAudio build has no WASAPI loopback. Each
     stream notes when its first block arrived so both files can be lined up on
-    one timeline later."""
+    one timeline later.
+
+    A meeting outlives its devices: a Bluetooth headset drops or switches
+    profile, a USB headset is plugged in, the call moves to other speakers.
+    Both streams then reopen (the system audio on whatever the default
+    speaker is now) and fill the time they missed with silence, so the two
+    files stay lined up. Each stream also records its wall-clock length
+    (meeting.json "clock"): the two run on different hardware clocks, and
+    _load_streams corrects the drift."""
+
+    SYSTEM_RETRY_SECONDS = 1.0
+    SPEAKER_CHECK_SECONDS = 3.0  # how often to look for a new default speaker
+    MIC_STALL_SECONDS = 2.0     # no mic data for this long: reopen the microphone
+    GAP_SECONDS = 1.0           # a longer pause between blocks is filled with silence
+    MAX_GAP_SECONDS = 600       # a longer one (the PC slept) is not: hours of zeros help nobody
 
     def __init__(self, folder, log, mic=None, speaker=None, max_seconds=4 * 3600, on_limit=None):
         self.folder = folder
@@ -656,28 +795,28 @@ class MeetingRecorder:
         self.stop_event = threading.Event()
         self.mic_queue = queue.Queue()
         self.first_block = {}
+        # stream -> {"first", "last": time.monotonic of block arrivals, "first_frames",
+        # "lost": seconds of gaps beyond MAX_GAP_SECONDS that were not filled}
+        self.clock = {}
+        self.gaps = {"mic": [], "system": []}   # [seconds into the meeting, seconds of silence added]
+        self._reopened = {}      # stream -> time.monotonic of a reopen: the next block after it follows a gap
         self.threads = []
         self.mic_stream = None
+        self.mic_lock = threading.Lock()   # opening and closing the mic stream: writer thread vs stop()
         self.system_error = None
         self.system_device = None
         self.started = None
+        self._t0 = None
 
     def start(self):
         import sounddevice as sd
         os.makedirs(self.folder, exist_ok=True)
         self.started = datetime.datetime.now()
+        self._t0 = time.monotonic()
         self.mic_writer = _WavWriter(os.path.join(self.folder, "mic.wav"))
         self.system_writer = _WavWriter(os.path.join(self.folder, "system.wav"))
-
-        def callback(indata, frames, time_info, status):
-            if "mic" not in self.first_block:
-                self.first_block["mic"] = time.monotonic()
-            self.mic_queue.put(indata.copy())
-
         try:
-            self.mic_stream = sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype="float32",
-                                             device=self.mic_device, callback=callback)
-            self.mic_stream.start()
+            self.mic_stream = self._open_mic(sd, self.mic_device)
         except Exception as e:
             self.mic_writer.close()
             self.system_writer.close()
@@ -689,60 +828,220 @@ class MeetingRecorder:
             th.start()
             self.threads.append(th)
 
+    def _open_mic(self, sd, device):
+        def callback(indata, frames, time_info, status):
+            self.mic_queue.put((time.monotonic(), indata.copy()))
+
+        stream = sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype="float32", device=device,
+                                callback=callback)
+        stream.start()
+        return stream
+
+    def _close_mic(self):
+        stream, self.mic_stream = self.mic_stream, None
+        if stream is not None:
+            try:
+                stream.stop()
+                stream.close()
+            except Exception:
+                pass
+
+    def _write(self, name, writer, block, arrived):
+        """Writes one block that arrived at `arrived` (time.monotonic). When
+        the stream was silent for more than GAP_SECONDS before it (a device
+        lost and reopened), the missing time is written as silence first."""
+        block = block.reshape(-1)
+        clock = self.clock.get(name)
+        if clock is None:
+            self._reopened.pop(name, None)   # the first open is no reopen
+            self.first_block[name] = arrived
+            self.clock[name] = {"first": arrived, "last": arrived, "first_frames": len(block), "lost": 0.0}
+        else:
+            missing = (arrived - clock["last"]) - len(block) / SAMPLE_RATE
+            # After a reopen the time lost is known to be a gap, however short:
+            # left out, a few 0.3 s device switches would add up to a shift the
+            # drift correction then smears over the whole file.
+            reopened = self._reopened.get(name)
+            exact = reopened is not None and arrived >= reopened   # a late block of the old stream is not it
+            if exact:
+                del self._reopened[name]
+            if missing > (0.0 if exact else self.GAP_SECONDS):
+                added = min(missing, self.MAX_GAP_SECONDS)
+                silence = int(added * SAMPLE_RATE)
+                clock["lost"] += missing - added
+                if silence:
+                    writer.write(np.zeros(silence, np.float32))
+                    self.gaps[name].append([round(clock["last"] - self._t0, 1), round(added, 1)])
+            clock["last"] = arrived
+        writer.write(block)
+
+    def _check_length(self, t0, state):
+        """The 10-minute notes and the maximum length, on the wall clock (so a
+        dead microphone does not keep a meeting running past its limit)."""
+        elapsed = time.monotonic() - t0
+        if elapsed >= state["next_note"]:
+            self.log(f"[MEETING] Still recording ({int(elapsed // 60)} min). Press the meeting hotkey to stop.")
+            state["next_note"] += 600
+        if elapsed >= self.max_seconds and self.on_limit and not self.stop_event.is_set():
+            self.log(f"[MEETING] Maximum length ({self.max_seconds // 60} min) reached. Stopping automatically.")
+            threading.Thread(target=self.on_limit, daemon=True).start()
+            self.on_limit = None
+
     def _mic_writer_loop(self):
-        t0 = time.monotonic()
-        next_note = 600
+        t0, state = time.monotonic(), {"next_note": 600}
+        last_data, lost, stalled = time.monotonic(), False, 0
         while not (self.stop_event.is_set() and self.mic_queue.empty()):
             try:
-                block = self.mic_queue.get(timeout=0.2)
+                arrived, block = self.mic_queue.get(timeout=0.2)
             except queue.Empty:
+                self._check_length(t0, state)
+                if self.stop_event.is_set() or time.monotonic() - last_data <= self.MIC_STALL_SECONDS:
+                    stalled = 0
+                    continue
+                # Twice in a row: after a long pause of the whole process (another
+                # meeting being processed) the callback may simply not have run yet.
+                stalled += 1
+                if stalled < 2:
+                    continue
+                if not lost:
+                    self.log("[Meeting Warning] The microphone stopped sending audio. Trying to reopen it; "
+                             "the gap is filled with silence.")
+                    lost = True
+                self._reopen_mic()
+                last_data, stalled = time.monotonic(), 0   # the next try in MIC_STALL_SECONDS
                 continue
-            self.mic_writer.write(block)
-            elapsed = time.monotonic() - t0
-            if elapsed >= next_note:
-                self.log(f"[MEETING] Still recording ({int(elapsed // 60)} min). Press the meeting hotkey to stop.")
-                next_note += 600
-            if elapsed >= self.max_seconds and self.on_limit and not self.stop_event.is_set():
-                self.log(f"[MEETING] Maximum length ({self.max_seconds // 60} min) reached. Stopping automatically.")
-                threading.Thread(target=self.on_limit, daemon=True).start()
-                self.on_limit = None
+            if lost:
+                self.log(f"[MEETING] The microphone is back"
+                         f"{' (the default microphone)' if self._mic_on_default else ''}.")
+                lost = False
+            last_data, stalled = time.monotonic(), 0
+            self._write("mic", self.mic_writer, block, arrived)
+            self._check_length(t0, state)
+
+    _mic_on_default = False
+
+    def _reopen_mic(self):
+        """The configured microphone, or the default one if that is gone.
+        PortAudio is not re-initialised (that would also stop a dictation in
+        progress): device=None is the MME "Sound Mapper", which resolves the
+        current Windows default each time a stream opens."""
+        import sounddevice as sd
+        with self.mic_lock:
+            self._close_mic()
+        reopened = time.monotonic()   # every block after this is the new stream's
+        # Opened outside the lock: a slow Bluetooth device must not hold up stop().
+        for device in dict.fromkeys((self.mic_device, None)):
+            if self.stop_event.is_set():
+                return
+            try:
+                stream = self._open_mic(sd, device)
+            except Exception:
+                continue
+            with self.mic_lock:
+                if self.stop_event.is_set():   # stop() came while the device was opening
+                    stream.stop()
+                    stream.close()
+                    return
+                self.mic_stream = stream
+                self._mic_on_default = device is None and self.mic_device is not None
+                self._reopened["mic"] = reopened
+            return
+
+    def _find_speaker(self, sc):
+        """The configured speaker, or the default one if that is gone (a call
+        moved from the headset to the laptop speakers)."""
+        if self.speaker_name:
+            try:
+                return sc.get_speaker(self.speaker_name)
+            except Exception:
+                pass
+        return sc.default_speaker()
+
+    def _speaker_changed(self, sc, current):
+        """True when the system audio should move to another speaker: the
+        configured one is back, or (none configured) Windows now plays on a
+        different default."""
+        try:
+            target = sc.get_speaker(self.speaker_name) if self.speaker_name else sc.default_speaker()
+            return _device_id(target) != current
+        except Exception:
+            return False   # the configured speaker is still gone
 
     def _system_loop(self):
-        try:
-            with warnings.catch_warnings():
-                # soundcard 0.4.x uses an array API NumPy 2.5 deprecates, and warns
-                # on every gap in loopback data (normal when nothing is playing).
-                warnings.simplefilter("ignore")
+        with warnings.catch_warnings():
+            # soundcard 0.4.x uses an array API NumPy 2.5 deprecates, and warns
+            # on every gap in loopback data (normal when nothing is playing).
+            warnings.simplefilter("ignore")
+            try:
                 import soundcard as sc
-                speaker = sc.get_speaker(self.speaker_name) if self.speaker_name else sc.default_speaker()
-                device = sc.get_microphone(id=str(speaker.name), include_loopback=True)
-                self.system_device = speaker.name
-                with device.recorder(samplerate=SAMPLE_RATE, channels=1, blocksize=1600) as rec:
-                    while not self.stop_event.is_set():
-                        block = rec.record(numframes=1600)
-                        if "system" not in self.first_block:
-                            self.first_block["system"] = time.monotonic()
-                        self.system_writer.write(block[:, 0] if block.ndim > 1 else block)
-        except Exception as e:
-            self.system_error = str(e)
-            self.log(f"[Meeting Warning] System audio cannot be recorded ({e}). Recording the microphone only.")
+            except Exception as e:
+                self.system_error = str(e)
+                self.log(f"[Meeting Warning] System audio cannot be recorded ({e}). Recording the microphone only.")
+                return
+            down = False
+            while not self.stop_event.is_set():
+                try:
+                    speaker = self._find_speaker(sc)
+                    device = sc.get_microphone(id=str(speaker.name), include_loopback=True)
+                    with device.recorder(samplerate=SAMPLE_RATE, channels=1, blocksize=1600) as rec:
+                        if down:
+                            self.log(f"[MEETING] System audio is back ({speaker.name}).")
+                        elif self.system_device and speaker.name != self.system_device:
+                            self.log(f"[MEETING] System audio now comes from {speaker.name}.")
+                        down, self.system_device = False, speaker.name
+                        self._reopened["system"] = time.monotonic()   # no-op before the first block
+                        next_check = time.monotonic() + self.SPEAKER_CHECK_SECONDS
+                        while not self.stop_event.is_set():
+                            # soundcard returns zeros while nothing plays, so the
+                            # stream keeps time; a long wait here is a fault.
+                            block = rec.record(numframes=1600)
+                            self._write("system", self.system_writer,
+                                        block[:, 0] if block.ndim > 1 else block, time.monotonic())
+                            if time.monotonic() >= next_check:
+                                # The headset can stay connected while Windows (or
+                                # Teams) moves the sound to other speakers: the
+                                # old endpoint then only records silence.
+                                if self._speaker_changed(sc, _device_id(speaker)):
+                                    break
+                                next_check = time.monotonic() + self.SPEAKER_CHECK_SECONDS
+                except Exception as e:
+                    if self.stop_event.is_set():
+                        break
+                    if not down:
+                        if "system" in self.clock:
+                            self.log(f"[Meeting Warning] System audio stopped ({e}). Retrying every second; "
+                                     f"the gap is filled with silence.")
+                        else:
+                            self.system_error = str(e)
+                            self.log(f"[Meeting Warning] System audio cannot be recorded ({e}). Recording the "
+                                     f"microphone, and retrying the system audio every second.")
+                        down = True
+                    self.stop_event.wait(self.SYSTEM_RETRY_SECONDS)
+            if "system" in self.clock:
+                self.system_error = None   # it worked in the end; outages are in "gaps"
 
     def stop(self):
         self.stop_event.set()
-        try:
-            self.mic_stream.stop()
-            self.mic_stream.close()
-        except Exception:
-            pass
+        with self.mic_lock:
+            self._close_mic()
         for th in self.threads:
             th.join(timeout=5)
+        with self.mic_lock:
+            self._close_mic()   # in case a reopen finished after the first close
         self.mic_writer.close()
         self.system_writer.close()
         t0 = min(self.first_block.values()) if self.first_block else 0.0
+        writers = {"mic": self.mic_writer, "system": self.system_writer}
         meta = {
             "started": self.started.isoformat(timespec="seconds"),
             "stopped": datetime.datetime.now().isoformat(timespec="seconds"),
             "offsets": {k: round(v - t0, 3) for k, v in self.first_block.items()},
+            # Wall-clock seconds from the first to the last block, minus any gap
+            # time that was not filled, and the samples written (silence for
+            # gaps included): see correct_drift.
+            "clock": {k: {"seconds": round(c["last"] - c["first"] - c["lost"], 3), "first_frames": c["first_frames"],
+                          "frames": writers[k].frames} for k, c in self.clock.items()},
+            "gaps": {k: v for k, v in self.gaps.items() if v},
             "system_device": self.system_device,
             "system_error": self.system_error,
         }
@@ -1048,6 +1347,13 @@ class MeetingManager:
                 if not os.path.exists(p):
                     continue
                 audio = read_wav(p)
+                clock = (meta.get("clock") or {}).get(name)
+                fixed = correct_drift(audio, clock)
+                if fixed is not audio:
+                    self.log(f"[Meeting] Lined up the {'microphone' if name == 'mic' else 'system audio'} clock "
+                             f"({(len(fixed) - len(audio)) / SAMPLE_RATE:+.2f} s over "
+                             f"{len(audio) / SAMPLE_RATE / 60:.0f} min).")
+                    audio = fixed
                 pad = int(offsets.get(name, 0.0) * SAMPLE_RATE)
                 if pad > 0:
                     audio = np.concatenate([np.zeros(pad, np.float32), audio])
@@ -1360,6 +1666,7 @@ class MeetingManager:
             sources = "Microphone (in-room)"
         if meta.get("system_error"):
             notes.append(f"System audio could not be recorded ({meta['system_error']}), so remote participants may be missing.")
+        notes += gap_notes(meta)
         info = {
             "title": f"Meeting {started:%Y-%m-%d %H:%M}",
             "date": f"{started:%A %d %B %Y, %H:%M}",
