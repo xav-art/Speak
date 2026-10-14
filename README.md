@@ -261,7 +261,10 @@ Tested and rejected (kept as opt-in config keys): prompt-lookup speculative deco
 
 ```text
 Speak/
-├── speak.py                  # The app: recording, transcription, AI cleanup, text insertion
+├── speak.py                  # The app: hotkeys, recording, the menu
+├── speak_engines.py          # Speech-to-text (Whisper) and AI cleanup (Qwen)
+├── speak_insert.py           # Putting text into the active window (paste or typing)
+├── speak_base.py             # Paths, the log, Windows handles shared by the modules
 ├── speak_dictionary.py       # Personal dictionary and learning from corrections
 ├── speak_text.py             # Text rules: fast path, fillers, filter for text Whisper invents
 ├── speak_meeting.py          # Meeting mode: recording, speaker detection, transcript, summary

@@ -49,7 +49,7 @@ def main():
     if args.only:
         cases = [c for c in cases if args.only in c["id"]]
 
-    speak.log = lambda *a, **k: None   # the per-call logs would bury the table
+    speak.speak_base.QUIET = True   # the per-call logs would bury the table
     cfg = speak.load_config(os.path.join(tempfile.mkdtemp(), "speak_config.json"))   # defaults, never the user's
     app = speak.SpeakApp.__new__(speak.SpeakApp)
     app.config = cfg

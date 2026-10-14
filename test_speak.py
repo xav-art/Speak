@@ -13,6 +13,8 @@ import unittest
 import numpy as np
 
 import speak_dictionary as sd
+import speak_engines
+import speak_insert
 import speak_meeting as sm
 import speak_text as st
 import speak
@@ -388,24 +390,24 @@ class TestModelDownload(unittest.TestCase):
         self.assertFalse(os.path.exists(dest + ".part"))
 
     def test_existing_model_is_not_downloaded_again(self):
-        old_dir = speak.LOCAL_LLM_DIR
-        speak.LOCAL_LLM_DIR = self.tmpdir
+        old_dir = speak_engines.LOCAL_LLM_DIR
+        speak_engines.LOCAL_LLM_DIR = self.tmpdir
         try:
             existing = os.path.join(self.tmpdir, speak.LOCAL_LLM_MODELS["0.5b"]["file"])
             open(existing, "wb").close()
             self.assertEqual(speak.ensure_local_llm("0.5b"), existing)
         finally:
-            speak.LOCAL_LLM_DIR = old_dir
+            speak_engines.LOCAL_LLM_DIR = old_dir
 
     def test_removed_gemini_mode_falls_back_to_local(self):
         app = speak.SpeakApp.__new__(speak.SpeakApp)
         app.config = {"ai_mode": "gemini", "local_model": "0.5b"}
-        old = speak.ensure_local_llm
-        speak.ensure_local_llm = lambda choice: None   # no model: raw Whisper, no download
+        old = speak_engines.ensure_local_llm
+        speak_engines.ensure_local_llm = lambda choice: None   # no model: raw Whisper, no download
         try:
             app._init_ai()
         finally:
-            speak.ensure_local_llm = old
+            speak_engines.ensure_local_llm = old
         self.assertEqual(app.ai_mode, "local")
         self.assertIsNone(app.local_llm)
 
@@ -1105,7 +1107,8 @@ class TestClipboardRestore(unittest.TestCase):
     def setUp(self):
         import threading
         self.real_user32 = speak._user32
-        speak._user32 = self.fake = self.FakeUser32()
+        self.fake = self.FakeUser32()
+        speak._user32 = speak_insert._user32 = self.fake   # the app and the insertion code
         self.app = speak.SpeakApp.__new__(speak.SpeakApp)
         self.app.clipboard_lock = threading.Lock()
         self.app._pending_restore = self.app._pending_restore_timer = None
@@ -1115,7 +1118,7 @@ class TestClipboardRestore(unittest.TestCase):
         self.snapshot = {"kind": "text", "text": "the user's clipboard"}
 
     def tearDown(self):
-        speak._user32 = self.real_user32
+        speak._user32 = speak_insert._user32 = self.real_user32
 
     def _wait_for_timer(self, until=lambda: False, timeout=2.0):
         """Waits for a timer to have had ample time to fire (or for until())."""
@@ -1185,9 +1188,9 @@ class TestClipboardRestore(unittest.TestCase):
     def _prepare_win32_fakes(self):
         """Stubs out keystrokes so insert_text / _learn_from_selection run headless."""
         import types
-        self.real_send_keys = speak.send_keys
-        speak.send_keys = lambda steps: True
-        self.addCleanup(setattr, speak, "send_keys", self.real_send_keys)
+        for module in (speak, speak_insert):   # insertion and the learn hotkey
+            self.addCleanup(setattr, module, "send_keys", module.send_keys)
+            module.send_keys = lambda steps: True
         self.app._release_modifiers = lambda timeout: True
         self.app.play_sound = lambda kind: None
         self.app.paste_mode = "auto"
