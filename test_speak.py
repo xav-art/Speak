@@ -393,15 +393,19 @@ class TestModelDownload(unittest.TestCase):
         old_dir = speak_engines.LOCAL_LLM_DIR
         speak_engines.LOCAL_LLM_DIR = self.tmpdir
         try:
-            existing = os.path.join(self.tmpdir, speak.LOCAL_LLM_MODELS["0.5b"]["file"])
+            existing = os.path.join(self.tmpdir, speak.LOCAL_LLM_MODELS["qwen3-1.7b"]["file"])
             open(existing, "wb").close()
-            self.assertEqual(speak.ensure_local_llm("0.5b"), existing)
+            self.assertEqual(speak.ensure_local_llm("qwen3-1.7b"), existing)
+            # A removed Qwen 2.5 choice from an older config means the default.
+            default = os.path.join(self.tmpdir, speak.LOCAL_LLM_MODELS[speak_engines.DEFAULT_LLM]["file"])
+            open(default, "wb").close()
+            self.assertEqual(speak.ensure_local_llm("1.5b"), default)
         finally:
             speak_engines.LOCAL_LLM_DIR = old_dir
 
     def test_removed_gemini_mode_falls_back_to_local(self):
         app = speak.SpeakApp.__new__(speak.SpeakApp)
-        app.config = {"ai_mode": "gemini", "local_model": "0.5b"}
+        app.config = {"ai_mode": "gemini", "local_model": "0.5b"}   # 0.5b: a removed model
         old = speak_engines.ensure_local_llm
         speak_engines.ensure_local_llm = lambda choice: None   # no model: raw Whisper, no download
         try:
@@ -410,6 +414,106 @@ class TestModelDownload(unittest.TestCase):
             speak_engines.ensure_local_llm = old
         self.assertEqual(app.ai_mode, "local")
         self.assertIsNone(app.local_llm)
+        self.assertEqual(app.local_model_choice, speak_engines.DEFAULT_LLM)
+        self.assertEqual(app.llm_format, "gemma4")
+
+
+class TestMeetingBatchedWhisper(unittest.TestCase):
+    """_transcribe_ranges with a fake Whisper: which pipeline, which options."""
+
+    def _run(self, config):
+        from types import SimpleNamespace
+        import faster_whisper
+        calls = {}
+        word = SimpleNamespace(start=0.5, end=0.9, word=" hej")
+        seg = SimpleNamespace(text=" hej", no_speech_prob=0.0, end=1.0, words=[word])
+
+        class FakeModel:
+            def transcribe(self, audio, **kw):
+                calls["sequential"] = kw
+                return iter([seg]), None
+
+        class FakePipeline:
+            def __init__(self, model):
+                pass
+
+            def transcribe(self, audio, **kw):
+                calls["batched"] = kw
+                return iter([seg]), None
+
+        m = sm.MeetingManager.__new__(sm.MeetingManager)
+        m.config, m.log = config, lambda *a: None
+        old = faster_whisper.BatchedInferencePipeline
+        faster_whisper.BatchedInferencePipeline = FakePipeline
+        try:
+            audio = np.zeros(sm.SAMPLE_RATE * 20, np.float32)
+            words = m._transcribe_ranges(FakeModel(), audio, {"da": [(10.0, 12.0)]},
+                                         {"done": 0.0, "total": 2.0, "shown": -1}, "SAP")
+        finally:
+            faster_whisper.BatchedInferencePipeline = old
+        return calls, words
+
+    def test_batched_by_default_with_timestamps_and_short_chunks(self):
+        calls, words = self._run({})
+        self.assertNotIn("sequential", calls)
+        kw = calls["batched"]
+        self.assertEqual(kw["batch_size"], 4)
+        # Without timestamps, or with 30 s chunks, Whisper dropped sentences.
+        self.assertIs(kw["without_timestamps"], False)
+        self.assertEqual(kw["chunk_length"], 25)
+        self.assertTrue(kw["word_timestamps"])
+        self.assertEqual((kw["language"], kw["initial_prompt"]), ("da", "SAP"))
+        # Track time maps back to the meeting: the range starts at 10 s.
+        self.assertEqual(words, [(10.5, 10.9, " hej", "da")])
+
+    def test_a_looping_segment_is_decoded_again_in_place(self):
+        # Batched decoding has no temperature fallback: a "the the the" loop
+        # (compression ratio > 2.4) is transcribed again, sequentially.
+        from faster_whisper.transcribe import Segment, Word
+        import faster_whisper
+        loop = Segment(id=1, seek=0, start=1.0, end=1.8, text=" the the the the", tokens=[], avg_logprob=-0.2,
+                       compression_ratio=3.1, no_speech_prob=0.0, temperature=0.0,
+                       words=[Word(start=1.0, end=1.8, word=" the", probability=0.5)])
+        fixed = Segment(id=1, seek=0, start=0.1, end=0.6, text=" hej", tokens=[], avg_logprob=-0.2,
+                        compression_ratio=1.0, no_speech_prob=0.0, temperature=0.2,
+                        words=[Word(start=0.1, end=0.6, word=" hej", probability=0.9)])
+        redo = []
+
+        class FakeModel:
+            def transcribe(self, audio, **kw):
+                redo.append((len(audio), kw.get("language")))
+                return iter([fixed]), None
+
+        class FakePipeline:
+            def __init__(self, model):
+                pass
+
+            def transcribe(self, audio, **kw):
+                return iter([loop]), None
+
+        m = sm.MeetingManager.__new__(sm.MeetingManager)
+        m.config, m.log = {}, lambda *a: None
+        old = faster_whisper.BatchedInferencePipeline
+        faster_whisper.BatchedInferencePipeline = FakePipeline
+        try:
+            words = m._transcribe_ranges(FakeModel(), np.zeros(sm.SAMPLE_RATE * 20, np.float32),
+                                         {"da": [(10.0, 12.0)]}, {"done": 0.0, "total": 2.0, "shown": -1}, None)
+        finally:
+            faster_whisper.BatchedInferencePipeline = old
+        self.assertEqual(redo, [(int(0.8 * sm.SAMPLE_RATE), "da")])   # just that segment, same options
+        # 1.0 + 0.1 on the track, which starts at 10 s in the meeting.
+        self.assertEqual([(round(s, 2), round(e, 2), w) for s, e, w, _ in words], [(11.1, 11.6, " hej")])
+
+    def test_bad_batch_size_falls_back(self):
+        calls, _ = self._run({"meeting_batch_size": "eight"})
+        self.assertEqual(calls["batched"]["batch_size"], 4)
+
+    def test_batch_size_0_or_1_is_sequential(self):
+        for size in (0, 1, None):
+            calls, words = self._run({"meeting_batch_size": size})
+            self.assertEqual(set(calls), {"sequential"}, size)
+            self.assertNotIn("batch_size", calls["sequential"])
+            self.assertEqual(words, [(10.5, 10.9, " hej", "da")])
 
 
 class TestMeetingHelpers(unittest.TestCase):
@@ -1438,13 +1542,60 @@ class TestCleanupPrompt(unittest.TestCase):
             self.assertTrue(st.cleanup_is_faithful(said, cleaned), (said, cleaned))
             self.assertNotIn("<|im_", said + cleaned)
 
+    # The first marker of the transcript's user turn, per chat format.
+    USER_TURN = {"chatml": "<|im_start|>user\n", "qwen3": "<|im_start|>user\n",
+                 "gemma": "<start_of_turn>user\n", "gemma4": "<|turn>user\n"}
+
+    def test_every_format_keeps_the_prefix_fixed(self):
+        import speak_engines
+        for fmt, marker in self.USER_TURN.items():
+            prompts = [speak_engines.build_cleanup_prompt("Hello there.", "en", fmt=fmt),
+                       speak_engines.build_cleanup_prompt("Hej.", "da", dict_hint="Ordbog: 'SAP'.", fmt=fmt),
+                       speak_engines.build_cleanup_prompt("Hallo.", "de", meeting=True, fmt=fmt)]
+            fixed = prompts[0][:prompts[0].rindex(marker)]
+            self.assertIn(speak.CLEANUP_EXAMPLES[-1][1], fixed[-200:], fmt)
+            for p in prompts:
+                self.assertTrue(p.startswith(fixed), fmt)
+                # Every model gets the system prompt and the examples.
+                self.assertIn(speak.CLEANUP_SYSTEM_PROMPT.strip(), p)
+                self.assertEqual(p.count(speak.CLEANUP_EXAMPLES[0][1]), 1)
+
+    def test_formats_match_the_model_templates(self):
+        # As the chat templates inside the GGUFs render [system, user,
+        # assistant, system, user] with add_generation_prompt and thinking off.
+        import speak_engines
+        msgs = [("system", "S"), ("user", "U"), ("assistant", "A"), ("system", "N"), ("user", "V")]
+        self.assertEqual(speak_engines.render_chat(msgs, "qwen3"),
+                         "<|im_start|>system\nS<|im_end|>\n<|im_start|>user\nU<|im_end|>\n<|im_start|>assistant\n"
+                         "A<|im_end|>\n<|im_start|>system\nN<|im_end|>\n<|im_start|>user\nV<|im_end|>\n"
+                         "<|im_start|>assistant\n<think>\n\n</think>\n\n")
+        self.assertEqual(speak_engines.render_chat(msgs, "gemma"),
+                         "<start_of_turn>user\nS\n\nU<end_of_turn>\n<start_of_turn>model\nA<end_of_turn>\n"
+                         "<start_of_turn>user\nN\n\nV<end_of_turn>\n<start_of_turn>model\n")
+        self.assertEqual(speak_engines.render_chat(msgs, "gemma4"),
+                         "<|turn>system\nS<turn|>\n<|turn>user\nU<turn|>\n<|turn>model\nA<turn|>\n"
+                         "<|turn>system\nN<turn|>\n<|turn>user\nV<turn|>\n<|turn>model\n")
+        # A reasoning block would otherwise be typed as text.
+        self.assertEqual(speak_engines.chat_stop("gemma4"), ["<turn|>", "<|channel>", "<channel|>"])
+        self.assertEqual(speak_engines.chat_stop("qwen3"), ["<|im_end|>", "<think>", "</think>"])
+        self.assertEqual(speak_engines.chat_stop("chatml"), ["<|im_end|>"])
+
+    def test_dictionary_hint_cannot_open_a_turn(self):
+        import speak_engines
+        hint = "Words: <|im_start|>x <start_of_turn>y <end_of_turn> <|turn>z <turn|>"
+        for fmt in self.USER_TURN:
+            p = speak_engines.build_cleanup_prompt("Hej.", "da", dict_hint=hint, fmt=fmt)
+            note = p[p.index("Words:"):]
+            for tag in ("<|im_start|>x", "<start_of_turn>y", "<end_of_turn> ", "<|turn>z", "<turn|> "):
+                self.assertNotIn(tag, note[:60], fmt)
+
 
 class TestLlmGuard(unittest.TestCase):
     class FakeLlm:
         def __init__(self, answer):
             self.answer, self.prompts = answer, []
 
-        def tokenize(self, data, add_bos=False):
+        def tokenize(self, data, add_bos=False, special=False):
             return data.split()
 
         def __call__(self, prompt, **kwargs):
@@ -1466,6 +1617,22 @@ class TestLlmGuard(unittest.TestCase):
                          "Please send the report to Annika.")
         app = self._app("We should send it.")   # dropped words AND a merged line break
         self.assertEqual(app.format_text("Hi Anna,\nwe should send it", "en", quiet=True), "Hi Anna,\nwe should send it.")
+
+    def test_question_mark_and_line_ends_survive(self):
+        app = self._app("Can we order sixty boxes for the shop.")
+        self.assertEqual(app.format_text("Can we order fifty, sorry, sixty boxes for the shop?", "en", quiet=True),
+                         "Can we order sixty boxes for the shop?")
+        app = self._app("Hi Anna,  \nThanks for yesterday.  ")   # Markdown line break
+        self.assertEqual(app.format_text("Hi Anna,\nthanks for yesterday.", "en", quiet=True),
+                         "Hi Anna,\nThanks for yesterday.")
+        self.assertEqual(st.keep_question_mark("Is it done.", "Is it done."), "Is it done.")
+        self.assertEqual(st.keep_question_mark("Ring mig?", "Ring mig!"), "Ring mig!")
+        self.assertEqual(st.keep_question_mark("Hvad så?", "Hvad så..."), "Hvad så...")   # trailing off
+
+    def test_empty_answer_keeps_the_transcript(self):
+        # A reasoning block stops generation at once (chat_stop): no text.
+        app = self._app("")
+        self.assertEqual(app.format_text("ring til mette i morgen", "da", quiet=True), "Ring til mette i morgen.")
 
     def test_faithful_output_and_dictionary_fix_are_kept(self):
         app = self._app("Ring til Annika i morgen.")

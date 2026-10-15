@@ -4,7 +4,7 @@ Author: xav-art (MIT License)
 Features:
 - 100% Offline & Private: Audio and text never leave your computer.
 - Local Speech-to-Text via faster-whisper (CTranslate2 int8 on CPU).
-- Local AI Post-Processing via Qwen 2.5 (cleans filler words, handles punctuation, formats bullet points).
+- Local AI Post-Processing via Gemma 4 E2B or Qwen3 1.7B (cleans filler words, handles punctuation, formats bullet points).
 - Fully Self-Contained: All models and configuration live within the Speak directory.
 - Zero Admin Rights Required: Runs entirely in Windows user-space without firewall alerts.
 - Dedicated Hotkey Support: Tap '<' (or '>', '<>', F8, Pause, etc.) to start/stop dictating.
@@ -112,7 +112,7 @@ def load_config(path=None):
         "model": "base",
         "language": None,
         "ai_mode": "local",
-        "local_model": "1.5b",
+        "local_model": "gemma4-e2b",
         "paste_mode": "auto",
         "learn_hotkey": "CTRL+ALT+L",
         "whisper_threads": 4,
@@ -128,6 +128,7 @@ def load_config(path=None):
         "high_priority": True,
         "meeting_hotkey": "CTRL+ALT+M",
         "meeting_model": "small",
+        "meeting_batch_size": 4,
         "meeting_folder": None,
         "meeting_cleanup": True,
         "meeting_summary": True,
@@ -770,7 +771,7 @@ class SpeakApp(EnginesMixin, InsertionMixin):
 
     def get_ai_status_str(self):
         if self.ai_mode == "local" and self.local_llm:
-            m_info = LOCAL_LLM_MODELS.get(self.local_model_choice, LOCAL_LLM_MODELS["1.5b"])
+            m_info = LOCAL_LLM_MODELS[self.local_model_choice]
             return f"LOCAL ({m_info['name']} - 100% Offline, CPU)"
         elif self.ai_mode == "off":
             return "OFF (Raw Whisper verbatim transcription)"
@@ -934,27 +935,26 @@ class SpeakApp(EnginesMixin, InsertionMixin):
                     log("handles stutters, and formats spoken commands ('bullet point', 'new line')")
                     log("running 100% locally and privately on your CPU.")
                     log("\nOptions:")
-                    log("  1 - Local Qwen 2.5 1.5B (Recommended ~2s, best for Danish + English)")
-                    log("  2 - Local Qwen 2.5 0.5B (Ultra-fast ~1s, 468 MB)")
-                    log("  3 - Turn AI Formatting OFF (Fastest: raw Whisper verbatim)")
-                    log("  4 - Test Current AI formatting on sample dictation")
+                    models = list(LOCAL_LLM_MODELS)
+                    off, test = str(len(models) + 1), str(len(models) + 2)
+                    for n, key in enumerate(models, 1):
+                        info = LOCAL_LLM_MODELS[key]
+                        log(f"  {n} - Local {info['name']} ({info['size']})")
+                    log(f"  {off} - Turn AI Formatting OFF (Fastest: raw Whisper verbatim)")
+                    log(f"  {test} - Test Current AI formatting on sample dictation")
                     log("  Enter - Return to main menu")
-                    sub = input("Choose option [1-4]: ").strip()
-                    if sub == "1":
+                    sub = input(f"Choose option [1-{test}]: ").strip()
+                    picks = {str(n): key for n, key in enumerate(models, 1)}   # not int(): "²".isdigit()
+                    if sub in picks:
                         self.config["ai_mode"] = "local"
-                        self.config["local_model"] = "1.5b"
+                        self.config["local_model"] = picks[sub]
                         save_config(self.config)
                         self.init_ai()
-                    elif sub == "2":
-                        self.config["ai_mode"] = "local"
-                        self.config["local_model"] = "0.5b"
-                        save_config(self.config)
-                        self.init_ai()
-                    elif sub == "3":
+                    elif sub == off:
                         self.config["ai_mode"] = "off"
                         save_config(self.config)
                         self.init_ai()
-                    elif sub == "4":
+                    elif sub == test:
                         log("\n[Testing] Testing with: 'uh I think we should, bullet point deploy the change, bullet point notify the team'...")
                         with self.engine_lock:   # shared with dictation and meeting cleanup
                             test_out = self.clean_text("uh I think we should, bullet point deploy the change, bullet point notify the team", "en")

@@ -1,6 +1,6 @@
 """
 Speak benchmark: runs every clip in bench/clips through the real dictation
-pipeline (Whisper, dictionary, fast path or Qwen) and reports speed and accuracy.
+pipeline (Whisper, dictionary, fast path or the LLM) and reports speed and accuracy.
 
 Nothing is typed or pasted, your speak_config.json is never written, and your
 personal dictionary is not used (an empty one is, or a copy of the file given
@@ -24,7 +24,7 @@ Metrics:
   STT WER   word error rate of the raw Whisper text against what was spoken,
             ignoring fillers such as "um" and "øh"
   lang      share of clips whose language was detected correctly
-  fast      share of clips that skipped Qwen
+  fast      share of clips that skipped the LLM
   phantom   no-speech clips that produced text (should be 0)
 """
 

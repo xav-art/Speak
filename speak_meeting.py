@@ -38,6 +38,7 @@ from ctypes import wintypes
 
 import numpy as np
 
+import speak_engines
 import speak_text
 
 _kernel32 = ctypes.WinDLL("kernel32")
@@ -76,8 +77,14 @@ ECHO_CORRELATION = 0.3          # above this, the call is audible in the mic (no
 ENROLL_SECONDS = 30
 ENROLL_MIN_SPEECH = 12          # seconds of actual speech needed for a reliable profile
 MAX_PAUSE_IN_TURN = 5.0         # a longer pause starts a new paragraph for the same speaker
-SUMMARY_CTX = 8192              # Qwen 2.5 supports 32k; 8k keeps RAM use near 250 MB extra
+SUMMARY_CTX = 8192              # both cleanup models support 32k; the KV cache for 8k is small next to the weights
 SUMMARY_CHUNK_TOKENS = 4500
+# Batched Whisper (meeting_batch_size): chunk length. Measured on a 10-minute
+# synthetic call: 1.5x faster than sequential with short turns, equal to 8 %
+# slower with 20-40 s monologues, same accuracy. 30 s dropped sentences, 20 s and 15 s
+# were accurate but lost the speed (a chunk costs a full 30 s window).
+BATCH_CHUNK_SECONDS = 25
+REPEAT_RATIO = 2.4              # faster-whisper's compression_ratio_threshold: above it Whisper looped
 
 ENROLL_TEXT = (
     "Read this aloud at a normal pace, or just talk about your week in any language:\n\n"
@@ -1470,20 +1477,57 @@ class MeetingManager:
             langs.update({(key, s[0]): main for s in segments_by_key[key]})
         return langs
 
+    def _redo_repetitive(self, model, track, segments, options):
+        """Batched decoding has no temperature fallback: a chunk where Whisper
+        loops ("the the the ...") comes out as it is. Such a segment
+        (compression ratio above faster-whisper's own 2.4 threshold) is
+        decoded again on its own, sequentially, with the fallback; its words
+        are moved back to the segment's place on the track."""
+        import dataclasses
+        for seg in segments:
+            if (getattr(seg, "compression_ratio", 0) or 0) <= REPEAT_RATIO or seg.end <= seg.start:
+                yield seg
+                continue
+            self.log(f"\n[Meeting] Whisper repeated itself at {format_timestamp(seg.start)} of a track; "
+                     "transcribing that part again.")
+            redo, _ = model.transcribe(track[int(seg.start * SAMPLE_RATE):int(seg.end * SAMPLE_RATE)], **options)
+            for r in redo:
+                yield dataclasses.replace(
+                    r, start=r.start + seg.start, end=r.end + seg.start,
+                    words=[dataclasses.replace(w, start=w.start + seg.start, end=w.end + seg.start)
+                           for w in r.words or []])
+
     def _transcribe_ranges(self, model, audio, ranges_by_lang, progress, prompt):
         """One Whisper call per language: that language's speech glued into one
         track. Returns [(start, end, word, lang)] on the meeting timeline.
         progress: {'done', 'total', 'shown'} in track seconds, shared by both streams."""
         words = []
         beam = int(self.config.get("meeting_beam_size", 1))
+        try:
+            batch = int(self.config.get("meeting_batch_size", 4) or 0)
+        except (TypeError, ValueError):   # a hand-edited "eight"
+            batch = 4
         for lang, ranges in ranges_by_lang.items():
             track, pieces = build_track(audio, ranges)
             if not pieces:
                 continue
-            segments, _ = model.transcribe(
-                track, language=lang, beam_size=beam, vad_filter=True,
-                vad_parameters=dict(min_silence_duration_ms=500),
-                word_timestamps=True, condition_on_previous_text=False, initial_prompt=prompt)
+            options = dict(language=lang, beam_size=beam, vad_filter=True,
+                           vad_parameters=dict(min_silence_duration_ms=500), word_timestamps=True,
+                           condition_on_previous_text=False, initial_prompt=prompt)
+            if batch > 1:
+                # Batched: VAD cuts the track into chunks of at most
+                # BATCH_CHUNK_SECONDS, and `batch` chunks share one encoder and
+                # decoder pass. Each chunk is decoded once, with no seek: when
+                # Whisper stops early, the rest of that chunk is lost. With
+                # 30 s chunks it dropped whole sentences (WER 6.4 -> 8.5 %,
+                # 19 % without timestamps); 25 s chunks lost nothing.
+                from faster_whisper import BatchedInferencePipeline
+                segments, _ = BatchedInferencePipeline(model).transcribe(
+                    track, batch_size=batch, chunk_length=BATCH_CHUNK_SECONDS, without_timestamps=False,
+                    **options)
+                segments = self._redo_repetitive(model, track, segments, options)
+            else:
+                segments, _ = model.transcribe(track, **options)
             for seg in segments:
                 if speak_text.is_hallucination(seg.text, seg.no_speech_prob):
                     if seg.text.strip():
@@ -1706,7 +1750,7 @@ class MeetingManager:
 
     def _summarize(self, turns):
         """Summary, decisions and action items (see the Minutes section above),
-        on an 8k-context Qwen instance of its own: the dictation instance keeps
+        on an 8k-context LLM instance of its own: the dictation instance keeps
         its 2k context and stays free for dictation."""
         llm = self.app.load_llm(SUMMARY_CTX)
         if llm is None:
@@ -1717,9 +1761,9 @@ class MeetingManager:
         language = LANGUAGE_NAMES.get(max(counts, key=counts.get), "English")
 
         def ask(system, user, max_tokens):
-            prompt = (f"<|im_start|>system\n{system}<|im_end|>\n"
-                      f"<|im_start|>user\n{user}<|im_end|>\n<|im_start|>assistant\n")
-            res = llm(prompt, max_tokens=max_tokens, temperature=0.1, stop=["<|im_end|>"])
+            fmt = getattr(self.app, "llm_format", "chatml")
+            prompt = speak_engines.render_chat([("system", system), ("user", user)], fmt)
+            res = llm(prompt, max_tokens=max_tokens, temperature=0.1, stop=speak_engines.chat_stop(fmt))
             return res["choices"][0]["text"].strip()
 
         def tokens(text):

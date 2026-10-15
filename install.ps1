@@ -292,12 +292,20 @@ function Invoke-Install {
     }
     Write-Ok 'Components installed.'
 
-    Write-Step 'Step 4 of 5: Downloading the speech and AI models (one time, about 1.3 GB)'
+    Write-Step 'Step 4 of 5: Downloading the speech and AI models (one time, about 3.3 GB)'
     Push-Location $dir
     try { & $venvPy -X utf8 (Join-Path $dir 'speak.py') --download-models }
     finally { Pop-Location }
     if ($LASTEXITCODE -ne 0) { Write-Warn 'Some models could not be downloaded. Speak will try again when it starts.' }
-    else { Write-Ok 'Models ready.' }
+    else {
+        Write-Ok 'Models ready.'
+        # Qwen 2.5 was replaced by Gemma 4 E2B / Qwen3 1.7B (Oct 2026); its files
+        # are unused. Removed only once the new model is in place.
+        foreach ($old in 'qwen2.5-1.5b-instruct-q4_k_m.gguf', 'qwen2.5-0.5b-instruct-q4_k_m.gguf') {
+            $path = Join-Path $dir "models\llm\$old"
+            if (Test-Path $path) { Remove-Item -Force $path -ErrorAction SilentlyContinue }
+        }
+    }
 
     Write-Step 'Step 5 of 5: Adding Speak to your Desktop and Start Menu'
     $launcher = Join-Path $dir 'start_speak.bat'

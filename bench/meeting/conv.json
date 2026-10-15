@@ -1,0 +1,13 @@
+[
+ {"voice":"Mark","text":"Good morning everyone, thanks for joining. Today I want to go through the spring catalogue launch and the open issues with the webshop."},
+ {"voice":"Zira","text":"Thanks. From the marketing side we are mostly ready. The campaign assets are approved, but we are still waiting for the final product photos from the studio."},
+ {"voice":"David","text":"On the webshop, the new checkout flow is deployed to the test environment. We found two bugs with the discount codes, and I expect them to be fixed by Thursday."},
+ {"voice":"Mark","text":"Okay, so the photos and the discount bug are the two blockers. Zira, can you chase the studio today and give us a date?"},
+ {"voice":"Zira","text":"Yes, I will call them after this meeting and send an update in the channel before lunch."},
+ {"voice":"Helle","text":"Hej allesammen. Jeg har et spørgsmål om lageret. Har vi nok varer i Aarhus til lanceringen, eller skal vi flytte noget fra Odense?"},
+ {"voice":"David","text":"I checked the stock report yesterday. Aarhus has enough for the first two weeks, but the ceramic bowls are low everywhere."},
+ {"voice":"Mark","text":"Good point. Let us order more ceramic bowls this week. David, please send me the numbers and I will place the order on Friday."},
+ {"voice":"Helle","text":"Det lyder godt. Jeg giver butikkerne besked om, at der kommer flere skåle i næste uge."},
+ {"voice":"Zira","text":"One more thing: the newsletter goes out on Monday, so every page has to be live by Sunday evening at the latest."},
+ {"voice":"Mark","text":"Agreed. Let us meet again on Thursday to check status. Thanks everyone, have a great day."}
+]
