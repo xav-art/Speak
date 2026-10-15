@@ -1629,6 +1629,19 @@ class TestLlmGuard(unittest.TestCase):
         self.assertEqual(st.keep_question_mark("Ring mig?", "Ring mig!"), "Ring mig!")
         self.assertEqual(st.keep_question_mark("Hvad så?", "Hvad så..."), "Hvad så...")   # trailing off
 
+    def test_menu_warm_up_runs_under_the_engine_lock(self):
+        # Switched on from the menu, the first call took 21.6 s cold: the
+        # warm-up pays it, and a dictation started meanwhile waits for it.
+        import threading
+        app = self._app("ok")
+        app.engine_lock, app.config, held = threading.RLock(), {}, []
+        app._format_text_local = lambda *a, **k: held.append(app.engine_lock._is_owned())
+        app.warm_up_llm()
+        self.assertEqual(held, [True])
+        app.local_llm = None
+        app.warm_up_llm()   # AI off or not loaded: nothing to warm
+        self.assertEqual(held, [True])
+
     def test_empty_answer_keeps_the_transcript(self):
         # A reasoning block stops generation at once (chat_stop): no text.
         app = self._app("")

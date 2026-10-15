@@ -950,6 +950,9 @@ class SpeakApp(EnginesMixin, InsertionMixin):
                         self.config["local_model"] = picks[sub]
                         save_config(self.config)
                         self.init_ai()
+                        if self.local_llm:
+                            log("[AI] Warming up the AI model in the background (about 20 s, once)...")
+                            threading.Thread(target=self.warm_up_llm, daemon=True).start()
                     elif sub == off:
                         self.config["ai_mode"] = "off"
                         save_config(self.config)

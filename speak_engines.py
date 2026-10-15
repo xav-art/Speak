@@ -415,6 +415,22 @@ class EnginesMixin:
         except Exception as e:
             log(f"[Warm-up] Skipped ({e}).")
 
+    def warm_up_llm(self):
+        """Warms up a model just switched on from the menu, so the next
+        dictation does not pay for it: the first call evaluates the whole
+        cached prompt prefix and reads the weights from disk (Gemma 4 E2B:
+        21.6 s cold, 1.4-2.4 s after). Holds engine_lock, so a dictation
+        started meanwhile waits for it. Run on a background thread."""
+        if not self.local_llm:
+            return
+        t0 = time.time()
+        try:
+            with self.engine_lock:
+                self._format_text_local("warm up", self.config.get("last_language") or "en", max_tokens=4, quiet=True)
+            log(f"[AI] Ready ({time.time() - t0:.0f}s warm-up).")
+        except Exception as e:
+            log(f"[Warm-up] Skipped ({e}).")
+
     # Language detection is unreliable on a phrase of a few seconds: "Det er
     # fint med mig" scores German 0.92, Danish 0.03 on Whisper base, yet is
     # transcribed perfectly once Danish is set. Up to this much speech, a
