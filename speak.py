@@ -128,6 +128,7 @@ def load_config(path=None):
         "high_priority": True,
         "meeting_hotkey": "CTRL+ALT+M",
         "meeting_model": "small",
+        "meeting_batch_size": 4,
         "meeting_folder": None,
         "meeting_cleanup": True,
         "meeting_summary": True,
@@ -934,23 +935,26 @@ class SpeakApp(EnginesMixin, InsertionMixin):
                     log("handles stutters, and formats spoken commands ('bullet point', 'new line')")
                     log("running 100% locally and privately on your CPU.")
                     log("\nOptions:")
-                    for n, key in enumerate(LOCAL_LLM_MODELS, 1):
+                    models = list(LOCAL_LLM_MODELS)
+                    off, test = str(len(models) + 1), str(len(models) + 2)
+                    for n, key in enumerate(models, 1):
                         info = LOCAL_LLM_MODELS[key]
                         log(f"  {n} - Local {info['name']} ({info['size']})")
-                    log("  3 - Turn AI Formatting OFF (Fastest: raw Whisper verbatim)")
-                    log("  4 - Test Current AI formatting on sample dictation")
+                    log(f"  {off} - Turn AI Formatting OFF (Fastest: raw Whisper verbatim)")
+                    log(f"  {test} - Test Current AI formatting on sample dictation")
                     log("  Enter - Return to main menu")
-                    sub = input("Choose option [1-4]: ").strip()
-                    if sub in ("1", "2"):
+                    sub = input(f"Choose option [1-{test}]: ").strip()
+                    picks = {str(n): key for n, key in enumerate(models, 1)}   # not int(): "²".isdigit()
+                    if sub in picks:
                         self.config["ai_mode"] = "local"
-                        self.config["local_model"] = list(LOCAL_LLM_MODELS)[int(sub) - 1]
+                        self.config["local_model"] = picks[sub]
                         save_config(self.config)
                         self.init_ai()
-                    elif sub == "3":
+                    elif sub == off:
                         self.config["ai_mode"] = "off"
                         save_config(self.config)
                         self.init_ai()
-                    elif sub == "4":
+                    elif sub == test:
                         log("\n[Testing] Testing with: 'uh I think we should, bullet point deploy the change, bullet point notify the team'...")
                         with self.engine_lock:   # shared with dictation and meeting cleanup
                             test_out = self.clean_text("uh I think we should, bullet point deploy the change, bullet point notify the team", "en")

@@ -180,8 +180,12 @@ LANGUAGE_NOTES = {"da": "Write in Danish.", "de": "Write in German.", "fr": "Wri
 
 
 def chat_stop(fmt):
-    """The end-of-turn marker generation stops at, per chat format."""
-    return {"gemma": ["<end_of_turn>"], "gemma4": ["<turn|>"]}.get(fmt, ["<|im_end|>"])
+    """Where generation stops, per chat format: the end-of-turn marker, and
+    the start of a reasoning block. Thinking is off in the prompt, but
+    "<|channel>" (Gemma 4) and "<think>" (Qwen3) are not end-of-generation
+    tokens and come out as literal text, which must never be typed."""
+    return {"gemma": ["<end_of_turn>"], "gemma4": ["<turn|>", "<|channel>", "<channel|>"],
+            "qwen3": ["<|im_end|>", "<think>", "</think>"]}.get(fmt, ["<|im_end|>"])
 
 
 def render_chat(messages, fmt="chatml"):
@@ -286,6 +290,9 @@ class EnginesMixin:
                     n_threads=int(self.config.get("llm_threads", 4)),
                     n_batch=512,
                     draft_model=draft_model,
+                    # Full sliding-window cache (llama.cpp's default today):
+                    # Gemma 4's prompt-prefix reuse needs the whole window.
+                    swa_full=True,
                     verbose=False
                 )
                 log(f"[AI] Local Mini LLM ready in {time.time() - t0:.2f}s! "
@@ -309,7 +316,7 @@ class EnginesMixin:
         try:
             import llama_cpp
             return llama_cpp.Llama(model_path=path, n_ctx=n_ctx, n_threads=int(self.config.get("llm_threads", 4)),
-                                   n_batch=512, verbose=False)
+                                   n_batch=512, swa_full=True, verbose=False)
         except Exception as e:
             log(f"[AI Warning] Could not load the summary model ({e}).")
             return None
@@ -654,7 +661,8 @@ class EnginesMixin:
                 # Output is roughly as long as the input; budget 1.5x + slack and
                 # never exceed what fits in the context window.
                 n_in = len(self.local_llm.tokenize(text.encode("utf-8"), add_bos=False))
-                n_prompt = len(self.local_llm.tokenize(prompt.encode("utf-8"), add_bos=False))
+                # special=True: the chat markers are one token each, as in the call.
+                n_prompt = len(self.local_llm.tokenize(prompt.encode("utf-8"), add_bos=False, special=True))
                 max_tokens = max(16, min(int(n_in * 1.5) + 32, self.llm_ctx - n_prompt - 8))
             res = self.local_llm(prompt, max_tokens=max_tokens, temperature=0.1, stop=chat_stop(fmt))
             # rstrip per line: Qwen3 writes Markdown line breaks ("  \n").
@@ -682,6 +690,11 @@ class EnginesMixin:
                     n_out = res.get("usage", {}).get("completion_tokens", 0)
                     log(f"[Local AI {dur:.2f}s, {n_out} tokens]: \"{cleaned}\"")
                 return cleaned
+            # Nothing before a stop: the model began a reasoning block
+            # (chat_stop) or answered with an empty turn.
+            if not quiet:
+                log("[AI Warning] The AI returned no text. Kept the transcript as spoken.")
+            return speak_text.light_cleanup(text)
         except Exception as e:
             log(f"[AI Warning] Local AI formatting failed ({e}). Using raw text.")
         return text

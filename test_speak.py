@@ -418,6 +418,104 @@ class TestModelDownload(unittest.TestCase):
         self.assertEqual(app.llm_format, "gemma4")
 
 
+class TestMeetingBatchedWhisper(unittest.TestCase):
+    """_transcribe_ranges with a fake Whisper: which pipeline, which options."""
+
+    def _run(self, config):
+        from types import SimpleNamespace
+        import faster_whisper
+        calls = {}
+        word = SimpleNamespace(start=0.5, end=0.9, word=" hej")
+        seg = SimpleNamespace(text=" hej", no_speech_prob=0.0, end=1.0, words=[word])
+
+        class FakeModel:
+            def transcribe(self, audio, **kw):
+                calls["sequential"] = kw
+                return iter([seg]), None
+
+        class FakePipeline:
+            def __init__(self, model):
+                pass
+
+            def transcribe(self, audio, **kw):
+                calls["batched"] = kw
+                return iter([seg]), None
+
+        m = sm.MeetingManager.__new__(sm.MeetingManager)
+        m.config, m.log = config, lambda *a: None
+        old = faster_whisper.BatchedInferencePipeline
+        faster_whisper.BatchedInferencePipeline = FakePipeline
+        try:
+            audio = np.zeros(sm.SAMPLE_RATE * 20, np.float32)
+            words = m._transcribe_ranges(FakeModel(), audio, {"da": [(10.0, 12.0)]},
+                                         {"done": 0.0, "total": 2.0, "shown": -1}, "SAP")
+        finally:
+            faster_whisper.BatchedInferencePipeline = old
+        return calls, words
+
+    def test_batched_by_default_with_timestamps_and_short_chunks(self):
+        calls, words = self._run({})
+        self.assertNotIn("sequential", calls)
+        kw = calls["batched"]
+        self.assertEqual(kw["batch_size"], 4)
+        # Without timestamps, or with 30 s chunks, Whisper dropped sentences.
+        self.assertIs(kw["without_timestamps"], False)
+        self.assertEqual(kw["chunk_length"], 25)
+        self.assertTrue(kw["word_timestamps"])
+        self.assertEqual((kw["language"], kw["initial_prompt"]), ("da", "SAP"))
+        # Track time maps back to the meeting: the range starts at 10 s.
+        self.assertEqual(words, [(10.5, 10.9, " hej", "da")])
+
+    def test_a_looping_segment_is_decoded_again_in_place(self):
+        # Batched decoding has no temperature fallback: a "the the the" loop
+        # (compression ratio > 2.4) is transcribed again, sequentially.
+        from faster_whisper.transcribe import Segment, Word
+        import faster_whisper
+        loop = Segment(id=1, seek=0, start=1.0, end=1.8, text=" the the the the", tokens=[], avg_logprob=-0.2,
+                       compression_ratio=3.1, no_speech_prob=0.0, temperature=0.0,
+                       words=[Word(start=1.0, end=1.8, word=" the", probability=0.5)])
+        fixed = Segment(id=1, seek=0, start=0.1, end=0.6, text=" hej", tokens=[], avg_logprob=-0.2,
+                        compression_ratio=1.0, no_speech_prob=0.0, temperature=0.2,
+                        words=[Word(start=0.1, end=0.6, word=" hej", probability=0.9)])
+        redo = []
+
+        class FakeModel:
+            def transcribe(self, audio, **kw):
+                redo.append((len(audio), kw.get("language")))
+                return iter([fixed]), None
+
+        class FakePipeline:
+            def __init__(self, model):
+                pass
+
+            def transcribe(self, audio, **kw):
+                return iter([loop]), None
+
+        m = sm.MeetingManager.__new__(sm.MeetingManager)
+        m.config, m.log = {}, lambda *a: None
+        old = faster_whisper.BatchedInferencePipeline
+        faster_whisper.BatchedInferencePipeline = FakePipeline
+        try:
+            words = m._transcribe_ranges(FakeModel(), np.zeros(sm.SAMPLE_RATE * 20, np.float32),
+                                         {"da": [(10.0, 12.0)]}, {"done": 0.0, "total": 2.0, "shown": -1}, None)
+        finally:
+            faster_whisper.BatchedInferencePipeline = old
+        self.assertEqual(redo, [(int(0.8 * sm.SAMPLE_RATE), "da")])   # just that segment, same options
+        # 1.0 + 0.1 on the track, which starts at 10 s in the meeting.
+        self.assertEqual([(round(s, 2), round(e, 2), w) for s, e, w, _ in words], [(11.1, 11.6, " hej")])
+
+    def test_bad_batch_size_falls_back(self):
+        calls, _ = self._run({"meeting_batch_size": "eight"})
+        self.assertEqual(calls["batched"]["batch_size"], 4)
+
+    def test_batch_size_0_or_1_is_sequential(self):
+        for size in (0, 1, None):
+            calls, words = self._run({"meeting_batch_size": size})
+            self.assertEqual(set(calls), {"sequential"}, size)
+            self.assertNotIn("batch_size", calls["sequential"])
+            self.assertEqual(words, [(10.5, 10.9, " hej", "da")])
+
+
 class TestMeetingHelpers(unittest.TestCase):
     def test_format_timestamp(self):
         self.assertEqual(sm.format_timestamp(0), "00:00:00")
@@ -1477,8 +1575,10 @@ class TestCleanupPrompt(unittest.TestCase):
         self.assertEqual(speak_engines.render_chat(msgs, "gemma4"),
                          "<|turn>system\nS<turn|>\n<|turn>user\nU<turn|>\n<|turn>model\nA<turn|>\n"
                          "<|turn>system\nN<turn|>\n<|turn>user\nV<turn|>\n<|turn>model\n")
-        self.assertEqual(speak_engines.chat_stop("gemma4"), ["<turn|>"])
-        self.assertEqual(speak_engines.chat_stop("qwen3"), ["<|im_end|>"])
+        # A reasoning block would otherwise be typed as text.
+        self.assertEqual(speak_engines.chat_stop("gemma4"), ["<turn|>", "<|channel>", "<channel|>"])
+        self.assertEqual(speak_engines.chat_stop("qwen3"), ["<|im_end|>", "<think>", "</think>"])
+        self.assertEqual(speak_engines.chat_stop("chatml"), ["<|im_end|>"])
 
     def test_dictionary_hint_cannot_open_a_turn(self):
         import speak_engines
@@ -1495,7 +1595,7 @@ class TestLlmGuard(unittest.TestCase):
         def __init__(self, answer):
             self.answer, self.prompts = answer, []
 
-        def tokenize(self, data, add_bos=False):
+        def tokenize(self, data, add_bos=False, special=False):
             return data.split()
 
         def __call__(self, prompt, **kwargs):
@@ -1527,6 +1627,12 @@ class TestLlmGuard(unittest.TestCase):
                          "Hi Anna,\nThanks for yesterday.")
         self.assertEqual(st.keep_question_mark("Is it done.", "Is it done."), "Is it done.")
         self.assertEqual(st.keep_question_mark("Ring mig?", "Ring mig!"), "Ring mig!")
+        self.assertEqual(st.keep_question_mark("Hvad så?", "Hvad så..."), "Hvad så...")   # trailing off
+
+    def test_empty_answer_keeps_the_transcript(self):
+        # A reasoning block stops generation at once (chat_stop): no text.
+        app = self._app("")
+        self.assertEqual(app.format_text("ring til mette i morgen", "da", quiet=True), "Ring til mette i morgen.")
 
     def test_faithful_output_and_dictionary_fix_are_kept(self):
         app = self._app("Ring til Annika i morgen.")

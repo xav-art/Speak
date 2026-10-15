@@ -204,7 +204,8 @@ def keep_question_mark(before, after):
     """after, with the question mark back if the transcript ended in one and
     the cleanup ended in a full stop instead. Whisper's "?" comes from the
     intonation; Qwen3 1.7B turned it into "." in a fifth of the questions."""
-    if before.rstrip().endswith("?") and after.rstrip().endswith("."):
+    tail = after.rstrip()
+    if before.rstrip().endswith("?") and tail.endswith(".") and not tail.endswith(".."):   # "..." trails off
         after = after.rstrip()[:-1] + "?"
     return after
 
