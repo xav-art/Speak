@@ -45,111 +45,35 @@ import win32clipboard
 # Dynamic directory paths (portable across any user account or path)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, BASE_DIR)
+import speak_text
 from speak_dictionary import Dictionary
 from speak_meeting import MeetingManager
+
+# The engines, the insertion code and the shared basics live in their own
+# modules (speak_engines, speak_insert, speak_base); the names other code and
+# the tests use stay importable from speak.
+import speak_base
+import speak_engines
+import speak_insert
+from speak_base import ALLOWED_LANGUAGES, LOCAL_LLM_DIR, MODELS_DIR, _kernel32, _user32, log
+from speak_engines import (CLEANUP_EXAMPLES, CLEANUP_SYSTEM_PROMPT, LANGUAGE_NOTES, LOCAL_LLM_MODELS,
+                           MEETING_TURN_NOTE, WHISPER_MODELS, EnginesMixin, LiveTranscriber, SilenceWatcher,
+                           build_cleanup_prompt, download_file, download_models, ensure_local_llm,
+                           get_dir_size_str)
+from speak_tray import TrayIcon, show_console
+from speak_insert import (EXTENDED_KEYS, INPUT, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY,
+                          KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, PM_REMOVE, VK_C, VK_CONTROL, VK_INSERT, VK_LWIN,
+                          VK_MENU, VK_RETURN, VK_RWIN, VK_SHIFT, VK_V, InsertionMixin, build_key_inputs,
+                          chord, send_keys)
 CONFIG_PATH = os.path.join(BASE_DIR, "speak_config.json")
-MODELS_DIR = os.path.join(BASE_DIR, "models")
-LOCAL_LLM_DIR = os.path.join(MODELS_DIR, "llm")
-
-LOCAL_LLM_MODELS = {
-    "1.5b": {
-        "file": "qwen2.5-1.5b-instruct-q4_k_m.gguf",
-        "name": "Qwen 2.5 1.5B (Recommended: Best Danish & English, ~2s)",
-        "repo": "Qwen/Qwen2.5-1.5B-Instruct-GGUF",
-        "sha256": "6a1a2eb6d15622bf3c96857206351ba97e1af16c30d7a74ee38970e434e9407e",
-        "size": "1.1 GB"
-    },
-    "0.5b": {
-        "file": "qwen2.5-0.5b-instruct-q4_k_m.gguf",
-        "name": "Qwen 2.5 0.5B (Ultra-Fast ~1s, 468 MB)",
-        "repo": "Qwen/Qwen2.5-0.5B-Instruct-GGUF",
-        "sha256": "74a4da8c9fdbcd15bd1f6d01d621410d31c6fc00986f5eb687824e7b93d7a9db",
-        "size": "470 MB"
-    }
-}
-
-ALLOWED_LANGUAGES = {
-    "en": "English",
-    "da": "Danish",
-    "de": "German",
-    "fr": "French"
-}
-
-def log(msg=""):
-    print(msg, flush=True)
-
-# Win32 handles that preserve the thread's last-error code. ctypes.windll +
-# kernel32.GetLastError() is unreliable: the interpreter can make other API
-# calls in between and overwrite the code, so "already running" and hotkey
-# conflict detection could silently report the wrong thing.
-_kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-_user32 = ctypes.WinDLL("user32", use_last_error=True)
-_kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR]
-_kernel32.CreateMutexW.restype = wintypes.HANDLE
-_kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
-_kernel32.CloseHandle.restype = wintypes.BOOL
-_user32.RegisterHotKey.argtypes = [wintypes.HWND, ctypes.c_int, wintypes.UINT, wintypes.UINT]
-_user32.RegisterHotKey.restype = wintypes.BOOL
-_user32.UnregisterHotKey.argtypes = [wintypes.HWND, ctypes.c_int]
-_user32.UnregisterHotKey.restype = wintypes.BOOL
-_user32.GetClipboardSequenceNumber.restype = wintypes.DWORD
-_user32.CountClipboardFormats.restype = ctypes.c_int
-_user32.GetForegroundWindow.restype = wintypes.HWND
-_user32.GetWindowTextLengthW.argtypes = [wintypes.HWND]
-_user32.GetWindowTextLengthW.restype = ctypes.c_int
-_user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
-_user32.GetWindowTextW.restype = ctypes.c_int
-_user32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
-_user32.GetClassNameW.restype = ctypes.c_int
-_user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
-_user32.GetWindowThreadProcessId.restype = wintypes.DWORD
-
-_kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
-_kernel32.OpenProcess.restype = wintypes.HANDLE
-_kernel32.QueryFullProcessImageNameW.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)]
-_kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
 
 # Windows Virtual Key Codes & Modifiers
 WM_HOTKEY = 0x0312
-PM_REMOVE = 0x0001
 MOD_NONE = 0x0000
 MOD_SHIFT = 0x0004
 MOD_CONTROL = 0x0002
 MOD_ALT = 0x0001
 MOD_NOREPEAT = 0x4000
-
-VK_SHIFT = 0x10
-VK_CONTROL = 0x11
-VK_MENU = 0x12
-VK_RETURN = 0x0D
-VK_V = 0x56
-VK_INSERT = 0x2D
-KEYEVENTF_KEYUP = 0x0002
-KEYEVENTF_UNICODE = 0x0004
-INPUT_KEYBOARD = 1
-
-# Windows SendInput 64-bit Structures
-class KEYBDINPUT(ctypes.Structure):
-    _fields_ = [
-        ("wVk", wintypes.WORD),
-        ("wScan", wintypes.WORD),
-        ("dwFlags", wintypes.DWORD),
-        ("time", wintypes.DWORD),
-        ("dwExtraInfo", ctypes.c_ulonglong)
-    ]
-
-class HARDWAREINPUT(ctypes.Structure):
-    _fields_ = [("uMsg", wintypes.DWORD), ("wParamL", wintypes.WORD), ("wParamH", wintypes.WORD)]
-
-class MOUSEINPUT(ctypes.Structure):
-    _fields_ = [("dx", wintypes.LONG), ("dy", wintypes.LONG), ("mouseData", wintypes.DWORD),
-                ("dwFlags", wintypes.DWORD), ("time", wintypes.DWORD), ("dwExtraInfo", ctypes.c_ulonglong)]
-
-class INPUT_UNION(ctypes.Union):
-    _fields_ = [("ki", KEYBDINPUT), ("mi", MOUSEINPUT), ("hi", HARDWAREINPUT)]
-
-class INPUT(ctypes.Structure):
-    _fields_ = [("type", wintypes.DWORD), ("u", INPUT_UNION)]
 
 FUNCTION_KEYS = {
     "F1": 0x70, "F2": 0x71, "F3": 0x72, "F4": 0x73,
@@ -158,91 +82,6 @@ FUNCTION_KEYS = {
     "PAUSE": 0x13, "CAPSLOCK": 0x14, "INSERT": 0x2D,
     "SCROLLLOCK": 0x91,
 }
-
-def get_dir_size_str(path):
-    if not os.path.exists(path):
-        return "Not downloaded yet"
-    total = 0
-    for root, dirs, files in os.walk(path):
-        for f in files:
-            try:
-                total += os.path.getsize(os.path.join(root, f))
-            except Exception:
-                pass
-    if total > 1024 * 1024 * 1024:
-        return f"{total / (1024 * 1024 * 1024):.2f} GB"
-    return f"{total / (1024 * 1024):.1f} MB"
-
-def download_file(url, dest, sha256, label):
-    """One-time model download with progress, written to <dest>.part and only
-    moved into place when the SHA-256 matches. urllib follows the Windows proxy
-    settings. Returns True when dest is ready."""
-    import hashlib
-    import urllib.request
-    part = dest + ".part"
-    try:
-        os.makedirs(os.path.dirname(dest), exist_ok=True)
-        req = urllib.request.Request(url, headers={"User-Agent": "Speak"})
-        with urllib.request.urlopen(req, timeout=60) as resp, open(part, "wb") as out:
-            total = int(resp.headers.get("Content-Length") or 0)
-            digest, done, shown = hashlib.sha256(), 0, -1
-            while True:
-                block = resp.read(1024 * 1024)
-                if not block:
-                    break
-                out.write(block)
-                digest.update(block)
-                done += len(block)
-                if total:
-                    pct = done * 100 // total
-                    if pct // 5 != shown:
-                        shown = pct // 5
-                        print(f"\r[Download] {label}: {pct:3d}% of {total / 1e6:,.0f} MB", end="", flush=True)
-        print(flush=True)
-        if digest.hexdigest() != sha256:
-            raise ValueError("checksum mismatch (the download is incomplete or was altered)")
-        os.replace(part, dest)
-        return True
-    except Exception as e:
-        print(flush=True)
-        log(f"[Download Error] {label} could not be downloaded: {e}")
-        try:
-            os.remove(part)
-        except OSError:
-            pass
-        return False
-
-def ensure_local_llm(choice):
-    """Path of the Qwen GGUF for this choice, downloading it once if missing.
-    Returns None when the model is not available."""
-    info = LOCAL_LLM_MODELS.get(choice, LOCAL_LLM_MODELS["1.5b"])
-    path = os.path.join(LOCAL_LLM_DIR, info["file"])
-    if os.path.exists(path):
-        return path
-    log(f"[AI] First-time setup: downloading the AI cleanup model ({info['size']}, one time only)...")
-    url = f"https://huggingface.co/{info['repo']}/resolve/main/{info['file']}"
-    return path if download_file(url, path, info["sha256"], info["file"]) else None
-
-def download_models(cfg):
-    """--download-models: fetch everything the current config needs, then exit.
-    Used by the installer so the first start is instant."""
-    ok = True
-    size = cfg.get("model", "base")
-    log(f"[Download] Speech model 'faster-whisper-{size}' (Hugging Face)...")
-    try:
-        from faster_whisper.utils import download_model
-        download_model(size, cache_dir=MODELS_DIR)
-        log(f"[Download] Speech model 'faster-whisper-{size}' is ready.")
-    except Exception as e:
-        log(f"[Download Error] Speech model could not be downloaded: {e}")
-        ok = False
-    if cfg.get("ai_mode", "local") == "local":
-        path = ensure_local_llm(cfg.get("local_model", "1.5b"))
-        if path:
-            log(f"[Download] AI cleanup model is ready: {os.path.basename(path)}")
-        else:
-            ok = False
-    return ok
 
 def prepare_console():
     """Window title 'Speak', and QuickEdit off: in the classic console, a stray
@@ -261,6 +100,10 @@ def prepare_console():
         pass
 
 _CONFIG_LOCK = threading.Lock()
+_CONSOLE_HANDLER = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.DWORD)
+_kernel32.SetConsoleCtrlHandler.argtypes = [_CONSOLE_HANDLER, wintypes.BOOL]
+_kernel32.SetConsoleCtrlHandler.restype = wintypes.BOOL
+
 
 def load_config(path=None):
     path = path or CONFIG_PATH
@@ -276,6 +119,11 @@ def load_config(path=None):
         "llm_threads": 6,
         "speculative_decoding": False,
         "llm_fast_path": True,
+        "live_transcription": True,
+        "hotkey_mode": "toggle",
+        "auto_stop_silence_seconds": 0,
+        "tray_icon": True,
+        "language_check_short_phrases": True,
         "warm_up": True,
         "high_priority": True,
         "meeting_hotkey": "CTRL+ALT+M",
@@ -332,83 +180,14 @@ def save_config(cfg, path=None):
             except Exception:
                 pass
 
-class SpeakApp:
-    def init_ai(self):
-        # Serialized with transcription: switching models from the menu waits
-        # for a running dictation instead of swapping the LLM mid-inference.
-        with self.engine_lock:
-            self._init_ai()
+class SpeakApp(EnginesMixin, InsertionMixin):
 
-    def _init_ai(self, mode=None):
-        # mode overrides the configured ai_mode for this session only.
-        self.ai_mode = mode or self.config.get("ai_mode", "local")
-        if self.ai_mode not in ("local", "off"):
-            # Older configs may still say "gemini": cloud mode was removed.
-            self.ai_mode = "local"
-        self.local_model_choice = self.config.get("local_model", "1.5b")
-        self.local_llm = None
-
-        if self.ai_mode == "off":
-            log("[AI] AI Formatting is turned OFF (Raw Whisper transcription).")
-            return
-
-        if self.ai_mode == "local":
-            model_info = LOCAL_LLM_MODELS.get(self.local_model_choice, LOCAL_LLM_MODELS["1.5b"])
-            model_path = ensure_local_llm(self.local_model_choice)
-            if not model_path:
-                log(f"[AI Warning] Local model '{model_info['file']}' is not available in {LOCAL_LLM_DIR}.")
-                log("[AI] Falling back to raw Whisper transcription.")
-                return
-            try:
-                import llama_cpp
-                log(f"[AI] Loading Local Mini LLM: {model_info['name']} (100% offline on CPU)...")
-                t0 = time.time()
-                draft_model = None
-                if self.config.get("speculative_decoding", False):
-                    # Prompt-lookup speculative decoding. Measured 2.5x SLOWER on
-                    # CPU with llama-cpp-python 0.3.x (drafts are verified one
-                    # by one in Python), so it is off by default. Kept as an
-                    # opt-in for future library versions / GPU builds.
-                    try:
-                        from llama_cpp.llama_speculative import LlamaPromptLookupDecoding
-                        draft_model = LlamaPromptLookupDecoding(num_pred_tokens=10)
-                    except Exception:
-                        draft_model = None
-                self.llm_ctx = 2048
-                self.local_llm = llama_cpp.Llama(
-                    model_path=model_path,
-                    n_ctx=self.llm_ctx,
-                    n_threads=int(self.config.get("llm_threads", 4)),
-                    n_batch=512,
-                    draft_model=draft_model,
-                    verbose=False
-                )
-                log(f"[AI] Local Mini LLM ready in {time.time() - t0:.2f}s! "
-                    f"(threads={self.local_llm.n_threads}, speculative={'on' if draft_model else 'off'})")
-            except Exception as e:
-                log(f"[AI Warning] Failed to initialize local LLM ({e}). Running raw Whisper.")
-                self.local_llm = None
-
-    def load_llm(self, n_ctx):
-        """A separate Qwen instance with a bigger context, for meeting summaries.
-        The GGUF is memory-mapped, so its weights are shared with the dictation
-        instance; only the extra KV cache costs RAM. Returns None when AI is off."""
-        if self.ai_mode == "off":
-            return None
-        path = ensure_local_llm(self.local_model_choice)
-        if not path:
-            return None
-        try:
-            import llama_cpp
-            return llama_cpp.Llama(model_path=path, n_ctx=n_ctx, n_threads=int(self.config.get("llm_threads", 4)),
-                                   n_batch=512, verbose=False)
-        except Exception as e:
-            log(f"[AI Warning] Could not load the summary model ({e}).")
-            return None
-
-    def __init__(self, config):
+    def __init__(self, config, load_speech_model=True):
+        """load_speech_model=False (--transcribe-meeting) skips the dictation
+        Whisper model: meetings load their own meeting_model."""
         self.config = config
         self.model_size = config.get("model", "base")
+        self._auto_stop_requested = False
 
         # Speak idles at 0% CPU but needs the whole machine for ~2s after each
         # dictation. ABOVE_NORMAL keeps Chrome/Teams/Outlook from stealing those
@@ -416,8 +195,7 @@ class SpeakApp:
         if config.get("high_priority", True):
             try:
                 ABOVE_NORMAL_PRIORITY_CLASS = 0x8000
-                handle = ctypes.windll.kernel32.GetCurrentProcess()
-                ctypes.windll.kernel32.SetPriorityClass(handle, ABOVE_NORMAL_PRIORITY_CLASS)
+                _kernel32.SetPriorityClass(_kernel32.GetCurrentProcess(), ABOVE_NORMAL_PRIORITY_CLASS)
             except Exception:
                 pass
         self.hotkey_req = self._normalize_key(config.get("hotkey", "<"))
@@ -433,6 +211,12 @@ class SpeakApp:
 
         self.running = True
         self.hotkey_rebind_event = threading.Event()
+        self.hotkey_vks = {}       # dictation hotkey id -> virtual key, for hold to talk
+        self.tray = None
+        self.silence = None
+        self._holding = False      # the hold-to-talk key is down
+        self._shut_down = False
+        self._shutdown_done = threading.Event()
 
         # Engines (Whisper + LLM) are used by exactly one thread at a time:
         # the transcription worker, or the console when it swaps a model.
@@ -446,6 +230,10 @@ class SpeakApp:
         self.worker_thread = None
         # Serializes clipboard borrowing (paste + restore vs. learn hotkey copy).
         self.clipboard_lock = threading.Lock()
+        # The clipboard restore that runs shortly after a paste (see
+        # _schedule_clipboard_restore). Guarded by clipboard_lock.
+        self._pending_restore = None
+        self._pending_restore_timer = None
 
         # Personal dictionary + auto-learning from corrections
         self.dictionary = Dictionary(BASE_DIR)
@@ -467,12 +255,14 @@ class SpeakApp:
         self.init_ai()
 
         # Initialize Local Faster-Whisper using self-contained models directory
-        log(f"[Whisper] Loading local speech model 'faster-whisper-{self.model_size}' on CPU (int8)...")
-        log(f"[Whisper] Storage Path: {self.model_storage_path}")
-        self.whisper_model = self._load_whisper(self.model_size)
-        log(f"[Whisper] Model 'faster-whisper-{self.model_size}' is ready.")
+        self.whisper_model = None
+        if load_speech_model:
+            log(f"[Whisper] Loading local speech model 'faster-whisper-{self.model_size}' on CPU (int8)...")
+            log(f"[Whisper] Storage Path: {self.model_storage_path}")
+            self.whisper_model = self._load_whisper(self.model_size)
+            log(f"[Whisper] Model 'faster-whisper-{self.model_size}' is ready.")
 
-        if self.config.get("warm_up", True):
+        if self.config.get("warm_up", True) and self.whisper_model is not None:
             self.warm_up()
 
         self.worker_thread = threading.Thread(target=self._worker_loop, name="speak-worker", daemon=True)
@@ -485,106 +275,12 @@ class SpeakApp:
             try:
                 if audio_data is None:   # shutdown sentinel
                     return
-                with self.engine_lock:
-                    self._process_worker(audio_data)
+                self._process_worker(audio_data)
             except Exception as e:
                 log(f"[Error] Worker failure: {e}")
             finally:
                 self.jobs.task_done()
-
-    def _load_whisper(self, size):
-        from faster_whisper import WhisperModel
-        model = WhisperModel(
-            size,
-            download_root=MODELS_DIR,
-            device="cpu",
-            compute_type="int8",
-            num_workers=1,
-            cpu_threads=int(self.config.get("whisper_threads", 4))
-        )
-        self._install_whisper_speedups(model)
-        return model
-
-    def _install_whisper_speedups(self, model):
-        """
-        Two small hooks on the faster-whisper instance (faster-whisper 1.2.x):
-
-        1. Encoder cache. With auto language detection faster-whisper runs the
-           30s encoder pass twice per dictation: once inside detect_language()
-           and once again in generate_segments() for the very same first
-           window. Caching the last encoder output by feature fingerprint
-           removes the second pass (~0.3s on base, ~1s+ on medium).
-        2. detect_language override. Builds the detection segment exactly the
-           way generate_segments builds its first segment (content frames,
-           zero-padded) so the fingerprints match, and restricts the result to
-           the 4 supported languages so a Danish speaker is never mis-detected
-           as Norwegian or Swedish.
-
-        Everything falls back to the stock faster-whisper path on any error.
-        """
-        import hashlib
-        try:
-            import faster_whisper
-            fw_version = getattr(faster_whisper, "__version__", "?")
-            if not str(fw_version).startswith("1.2."):
-                log(f"[Whisper Warning] Speed patches were tested on faster-whisper 1.2.x, found {fw_version}. "
-                    "Pin the version from requirements.txt if transcription misbehaves.")
-            from faster_whisper.transcribe import pad_or_trim
-        except Exception as e:
-            log(f"[Whisper Warning] Speed patches disabled, running stock faster-whisper ({e}).")
-            return
-
-        original_encode = model.encode
-        original_detect = model.detect_language
-        cache = {"key": None, "out": None}
-
-        def cached_encode(features):
-            try:
-                arr = np.ascontiguousarray(features)
-                key = (arr.shape, hashlib.blake2b(arr.tobytes(), digest_size=16).digest())
-            except Exception:
-                return original_encode(features)
-            if cache["key"] == key and cache["out"] is not None:
-                return cache["out"]
-            out = original_encode(features)
-            cache["key"], cache["out"] = key, out
-            return out
-
-        real_model = model.model
-        allowed_tokens = {f"<|{code}|>": code for code in ALLOWED_LANGUAGES}
-        nb_max_frames = model.feature_extractor.nb_max_frames
-
-        def fast_detect_language(audio=None, features=None, **kwargs):
-            if features is None:
-                return original_detect(audio=audio, features=features, **kwargs)
-            try:
-                content_frames = features.shape[-1] - 1
-                segment = pad_or_trim(features[..., :min(nb_max_frames, content_frames)])
-                results = real_model.detect_language(cached_encode(segment))[0]
-                probs = [(allowed_tokens[tok], p) for tok, p in results if tok in allowed_tokens]
-                if not probs:
-                    probs = [(tok[2:-2], p) for tok, p in results]
-                language, probability = probs[0]
-                return language, probability, probs
-            except Exception:
-                return original_detect(audio=audio, features=features, **kwargs)
-
-        model.encode = cached_encode
-        model.detect_language = fast_detect_language
-        model._speak_encode_cache = cache
-
-    def warm_up(self):
-        """First inference after loading is 2-3x slower (page-in, thread spin-up).
-        Do it now, on silence, so the user's first dictation is already fast."""
-        t0 = time.time()
-        try:
-            silence = np.zeros(16000, dtype=np.float32)
-            list(self.whisper_model.transcribe(silence, beam_size=1, language="en", vad_filter=False)[0])
-            if self.local_llm:
-                self._format_text_local("warm up", self.config.get("last_language") or "en", max_tokens=4, quiet=True)
-            log(f"[Ready] Engines warmed up in {time.time() - t0:.2f}s.")
-        except Exception as e:
-            log(f"[Warm-up] Skipped ({e}).")
+                self.refresh_tray()
 
     def _normalize_key(self, key_str):
         k = str(key_str).strip().lstrip("^").strip()
@@ -620,7 +316,11 @@ class SpeakApp:
         if self.is_recording:
             self.audio_frames.append(indata.copy())
             # Auto-stop if recording is left active indefinitely
-            if len(self.audio_frames) * frames / self.sample_rate > self.MAX_RECORDING_SECONDS:
+            # Blocks keep arriving until the stop thread has closed the
+            # stream: start that thread once, not once per block.
+            if (len(self.audio_frames) * frames / self.sample_rate > self.MAX_RECORDING_SECONDS
+                    and not self._auto_stop_requested):
+                self._auto_stop_requested = True
                 log(f"[Audio Info] Maximum recording duration ({self.MAX_RECORDING_SECONDS}s) reached. Stopping automatically.")
                 threading.Thread(target=self.stop_recording, daemon=True).start()
 
@@ -635,7 +335,9 @@ class SpeakApp:
             if self.is_recording:
                 return
             self.audio_frames = []
+            self._auto_stop_requested = False
             self.is_recording = True
+            self.live = None
             try:
                 self.record_stream = sd.InputStream(
                     samplerate=self.sample_rate,
@@ -644,6 +346,15 @@ class SpeakApp:
                     callback=self.audio_callback
                 )
                 self.record_stream.start()
+                if self.config.get("live_transcription", True) and self.whisper_model is not None:
+                    # Long dictations: pieces are transcribed while the user speaks.
+                    self.live = LiveTranscriber(self, self.audio_frames, self.sample_rate)
+                    self.live.start()
+                self.silence = None
+                silence = self._auto_stop_seconds()
+                if silence:
+                    self.silence = SilenceWatcher(self.audio_frames, silence, self._stop_on_silence, self.sample_rate)
+                    self.silence.start()
             except Exception as e:
                 self.is_recording = False
                 log(f"[Audio Error] Could not open microphone: {e}")
@@ -653,7 +364,11 @@ class SpeakApp:
                 return
 
         threading.Thread(target=self.play_sound, args=("start",), daemon=True).start()
-        log("\n[LISTENING...] Speak now... (Tap hotkey again to stop and insert)")
+        self.refresh_tray()
+        if self.config.get("hotkey_mode") == "hold":
+            log("\n[LISTENING...] Speak now... (Release the hotkey to insert; after a short tap, tap again)")
+        else:
+            log("\n[LISTENING...] Speak now... (Tap hotkey again to stop and insert)")
 
     def stop_recording(self):
         with self.lock:
@@ -666,10 +381,17 @@ class SpeakApp:
             except Exception:
                 pass
             captured = list(self.audio_frames)
+            live, self.live = self.live, None
+            if self.silence is not None:
+                self.silence.stop_event.set()
+                self.silence = None
 
         threading.Thread(target=self.play_sound, args=("stop",), daemon=True).start()
 
         if not captured:
+            self.refresh_tray()
+            if live:
+                live.stop_event.set()
             log("[Warning] No audio recorded.")
             return
 
@@ -677,7 +399,10 @@ class SpeakApp:
         duration = len(audio_data) / self.sample_rate
 
         if duration < 0.35:
+            if live:
+                live.stop_event.set()
             log(f"[Ignored] Audio too short ({duration:.2f}s).")
+            self.refresh_tray()
             return
 
         pending = self.jobs.unfinished_tasks
@@ -685,50 +410,114 @@ class SpeakApp:
             log(f"[QUEUED] {duration:.1f}s of speech - will be inserted after the {pending} dictation(s) still processing.")
         else:
             log(f"[TRANSCRIBING] Processing {duration:.1f}s of speech using faster-whisper-{self.model_size}...")
-        self.jobs.put(audio_data)
+        self.jobs.put((audio_data, live))
+        self.refresh_tray()
 
-    def _process_worker(self, audio_data):
+    def _auto_stop_seconds(self):
+        try:
+            seconds = float(self.config.get("auto_stop_silence_seconds") or 0)
+        except (TypeError, ValueError):
+            return 0
+        return seconds if seconds >= 1 else 0   # under a second would cut off normal pauses
+
+    def _stop_on_silence(self, watcher):
+        """The SilenceWatcher's call. Not while the hold-to-talk key is held
+        (the user is still talking, or pausing on purpose), and only for the
+        dictation that watcher belongs to."""
+        if self._holding:
+            return False
+        with self.lock:
+            if self.silence is not watcher or not self.is_recording:
+                return True   # that dictation has ended: nothing to stop
+        log(f"[Auto-stop] {self._auto_stop_seconds():g} s without speech: stopping.")
+        threading.Thread(target=self.stop_recording, daemon=True).start()
+        return True
+
+    HOLD_SECONDS = 0.5   # held longer than this: release stops (hold to talk); shorter: a tap
+
+    def hold_to_talk(self, vk):
+        """hotkey_mode "hold": recording runs while the key is held. A short
+        tap still starts a dictation that the next tap stops, so tapping
+        works as before. Runs on its own thread per key press."""
+        if self.is_recording:
+            self.stop_recording()   # the tap that ends a tapped dictation
+            return
+        pressed = time.monotonic()
+        self.start_recording()
+        # Released while the microphone was opening (a slow device can take
+        # half a second): that was a tap, whatever the clock says.
+        if vk is None or not self.is_recording:
+            return
+        if not _user32.GetAsyncKeyState(vk) & 0x8000:
+            if time.monotonic() - pressed >= self.HOLD_SECONDS:
+                log("[Hotkey] The microphone took a moment to open, so this counts as a tap: "
+                    "tap again to insert.")
+            return
+        self._holding = True
+        try:
+            while self.is_recording and _user32.GetAsyncKeyState(vk) & 0x8000:
+                time.sleep(0.02)
+        finally:
+            self._holding = False
+        if self.is_recording and time.monotonic() - pressed >= self.HOLD_SECONDS:
+            self.stop_recording()
+
+    def refresh_tray(self):
+        """Shows what Speak is doing: recording, a meeting, working, or ready."""
+        tray = self.tray
+        if tray is None:
+            return
+        if self.is_recording:
+            state = "recording"
+        elif self.meetings.is_recording:
+            state = "meeting"
+        elif self.jobs.unfinished_tasks or self.meetings.jobs.unfinished_tasks:
+            state = "working"
+        else:
+            state = "idle"
+        tray.set_state(state)
+
+    def _process_worker(self, job):
+        audio_data, live = job if isinstance(job, tuple) else (job, None)
         t0 = time.time()
         try:
-            # 1. Local Whisper Speech-to-Text
-            # language=None lets faster-whisper detect the language on the first
-            # window; our _LanguageFilter restricts it to the 4 supported
-            # languages and the encoder cache makes detection nearly free.
-            target_lang = self.language if self.language in ALLOWED_LANGUAGES else None
-            dict_prompt = self.dictionary.whisper_prompt()
+            # 1. Whisper. A long dictation was partly transcribed while it was
+            #    spoken: finish() does the rest (and takes engine_lock itself).
+            pieces = cleaned = stt = None
+            if live is not None:
+                raw_text, target_lang, lang_prob, cleaned = live.finish(audio_data)
+                pieces, stt = live.during, live.stt_seconds
+            # Steps 1 and 2 use the shared engines. Insertion does not, so a
+            # meeting being cleaned up does not wait for the paste.
+            with self.engine_lock:
+                if live is None:
+                    raw_text, target_lang, lang_prob = self.transcribe(audio_data)
+                t_whisper = time.time() - t0 if stt is None else stt
 
-            segments, info = self.whisper_model.transcribe(
-                audio_data,
-                beam_size=1,
-                language=target_lang,
-                vad_filter=True,
-                vad_parameters=dict(min_silence_duration_ms=400),
-                without_timestamps=True,
-                condition_on_previous_text=False,
-                # initial_prompt biases decoding toward the dictionary spellings.
-                # (hotwords= was tested too, but it makes Whisper stutter on
-                # multi-word names: "Salesforce Force".)
-                initial_prompt=dict_prompt
-            )
-            raw_text = " ".join([seg.text for seg in segments]).strip()
-            t_whisper = time.time() - t0
+                if not raw_text:
+                    log("[Info] No speech detected.")
+                    return
 
-            if not raw_text:
-                log("[Info] No speech detected.")
-                return
+                self.last_language = target_lang
+                if self.config.get("last_language") != target_lang:
+                    self.config["last_language"] = target_lang
+                    save_config(self.config)
 
-            target_lang = info.language if info.language in ALLOWED_LANGUAGES else "en"
-            lang_prob = info.language_probability if self.language is None else 1.0
-            self.last_language = target_lang
-            if self.config.get("last_language") != target_lang:
-                self.config["last_language"] = target_lang
-                save_config(self.config)
+                lang_name = ALLOWED_LANGUAGES.get(target_lang, target_lang.upper())
+                in_pieces = f", after {pieces} piece(s) done while you spoke" if pieces else ""
+                log(f"[Whisper STT {t_whisper:.2f}s{in_pieces}] [{lang_name} ({target_lang}) - {lang_prob*100:.0f}% confidence]: \"{raw_text}\"")
 
-            lang_name = ALLOWED_LANGUAGES.get(target_lang, target_lang.upper())
-            log(f"[Whisper STT {t_whisper:.2f}s] [{lang_name} ({target_lang}) - {lang_prob*100:.0f}% confidence]: \"{raw_text}\"")
-
-            # 2. Dictionary + Local AI Formatting & Cleanup
-            final_text = self.clean_text(raw_text, target_lang)
+                # 2. Dictionary + Local AI Formatting & Cleanup (done piece by
+                #    piece while recording, for a long dictation)
+                if cleaned is not None:
+                    final_text = cleaned
+                    if self.ai_mode != "off" and self.local_llm:
+                        log(f"[AI Formatted, piece by piece]: \"{final_text}\"")
+                else:
+                    final_text = self.clean_text(raw_text, target_lang)
+                if not final_text:
+                    log("[Info] Only filler words were heard. Nothing to insert.")
+                    return
 
             # 3. Universal text insertion into active window
             with self.clipboard_lock:
@@ -738,395 +527,18 @@ class SpeakApp:
                 threading.Thread(target=self.play_sound, args=("success",), daemon=True).start()
                 log(f"[DONE] Inserted in {elapsed:.2f}s! [Ready for next dictation] "
                     f"(Fix a word? Select the sentence and tap {self.learn_hotkey_req} to teach Speak.)\n")
-                # Put the user's own clipboard back once the target app has pasted.
-                self._restore_clipboard(restore_token)
+                # Put the user's own clipboard back once the target app has
+                # pasted, without holding up the next dictation meanwhile.
+                self._schedule_clipboard_restore(restore_token)
+
+            # Usage counts rank the user's words for the Whisper prompt. This
+            # writes the dictionary file, so it runs once the text is in and
+            # holds neither lock. (Meeting turns are not counted.)
+            self.dictionary.note_usage(final_text)
 
         except Exception as e:
             log(f"[Error] Transcription failed: {e}")
             threading.Thread(target=self.play_sound, args=("error",), daemon=True).start()
-
-    def clean_text(self, raw_text, lang, use_llm=True, verbose=True, instructions=None):
-        """Dictionary fixes, Qwen cleanup (or the fast path for short clean
-        phrases), then dictionary casing. Shared by dictation and meeting
-        transcripts; the caller holds engine_lock. Meetings pass verbose=False:
-        they skip the per-turn logs and the usage counts, which rank the
-        user's own dictated words. instructions replaces the dictation system
-        prompt (meetings use a stricter "do not rephrase" one)."""
-        # Learned mishearings: confirmed ones are replaced right here, the
-        # rest become a one-line hint for the LLM (only when relevant).
-        text, dict_hint, applied = self.dictionary.prepare(raw_text, lang)
-        if verbose:
-            for heard, word in applied:
-                log(f"[Dictionary] '{heard}' -> '{word}' (learned correction)")
-
-        if use_llm and self.ai_mode != "off" and self.local_llm:
-            if self.config.get("llm_fast_path", True) and not dict_hint and not self._needs_llm(text):
-                text = self._light_cleanup(text)
-                if verbose:
-                    log(f"[Fast path] Short clean phrase, LLM skipped: \"{text}\"")
-            else:
-                enhanced = self.format_text(text, lang, dict_hint, quiet=not verbose, instructions=instructions)
-                if enhanced:
-                    text = enhanced
-                    if verbose:
-                        log(f"[AI Formatted]: \"{text}\"")
-
-        # Deterministic safety net: dictionary spellings always win.
-        text = self.dictionary.apply_casing(text)
-        if verbose:
-            self.dictionary.note_usage(text)
-        return text
-
-    # Words that mean the LLM has real work to do. Anything short without one of
-    # these ("yes that sounds good", "tak for i dag") is inserted straight away.
-    FILLER_OR_COMMAND = {
-        "um", "uh", "uhm", "umm", "hmm", "erm", "er", "ah", "like", "actually", "basically",
-        "øh", "øhm", "altså", "sådan", "hvad hedder det", "ikk", "ikke også",
-        "äh", "ähm", "also", "quasi", "sozusagen", "halt",
-        "euh", "ben", "bah", "genre", "en fait", "du coup",
-        "bullet", "point", "new", "line", "paragraph", "punkt", "punktum", "linje", "linjeskift",
-        "komma", "comma", "period", "aufzählungspunkt", "zeile", "absatz", "puce", "ligne",
-        "scratch", "wait", "no", "nej", "nein", "non", "mean", "correction",
-    }
-    FAST_PATH_MAX_WORDS = 8
-
-    def _needs_llm(self, text):
-        words = text.lower().split()
-        if len(words) > self.FAST_PATH_MAX_WORDS:
-            return True
-        stripped = [w.strip(".,;:!?\"'()") for w in words]
-        if any(w in self.FILLER_OR_COMMAND for w in stripped):
-            return True
-        if any(a == b for a, b in zip(stripped, stripped[1:])):   # stutter: "the the"
-            return True
-        if any(ch.isdigit() for ch in text):                        # numbers/dates need formatting
-            return True
-        return False
-
-    def _light_cleanup(self, text):
-        text = " ".join(text.split())
-        if text and text[0].islower():
-            text = text[0].upper() + text[1:]
-        if text and text[-1] not in ".!?:":
-            text += "."
-        return text
-
-    def format_text(self, text, lang, dict_hint="", quiet=False, instructions=None):
-        if not text or not text.strip():
-            return text
-        if self.ai_mode == "local" and self.local_llm:
-            return self._format_text_local(text, lang, quiet=quiet, dict_hint=dict_hint, instructions=instructions)
-        return text
-
-    # Long dictations are cleaned in sentence-aligned chunks so we never blow the
-    # LLM context window (the old fixed max_tokens=150 silently truncated anything
-    # longer than ~100 words).
-    LLM_CHUNK_WORDS = 160
-
-    def _split_for_llm(self, text):
-        words = text.split()
-        if len(words) <= self.LLM_CHUNK_WORDS:
-            return [text]
-        import re
-        sentences = re.split(r"(?<=[.!?])\s+", text)
-        chunks, current = [], []
-        for s in sentences:
-            if current and len(" ".join(current + [s]).split()) > self.LLM_CHUNK_WORDS:
-                chunks.append(" ".join(current))
-                current = []
-            current.append(s)
-        if current:
-            chunks.append(" ".join(current))
-        return chunks
-
-    def _format_text_local(self, text, lang, max_tokens=None, quiet=False, dict_hint="", instructions=None):
-        chunks = self._split_for_llm(text)
-        if len(chunks) > 1:
-            outputs = []
-            for c in chunks:
-                outputs.append(self._format_chunk_local(c, lang, max_tokens, quiet, dict_hint, instructions))
-            return " ".join(o.strip() for o in outputs if o)
-        return self._format_chunk_local(text, lang, max_tokens, quiet, dict_hint, instructions)
-
-    def _format_chunk_local(self, text, lang, max_tokens=None, quiet=False, dict_hint="", instructions=None):
-        # The hint sits at the very end of the system prompt: the whole prompt
-        # before it stays byte-identical between dictations, so llama.cpp
-        # reuses its KV cache and only the transcript itself is evaluated.
-        dict_suffix = dict_hint or ""
-        if instructions:
-            prompt = f"""<|im_start|>system
-{instructions}{dict_suffix}<|im_end|>
-<|im_start|>user
-{text}<|im_end|>
-<|im_start|>assistant
-"""
-        elif lang == "da":
-            prompt = f"""<|im_start|>system
-Du er en intelligent dikteringsassistent. Rens den indtalte tekst:
-- Fjern fyldord ('øh', 'altså', 'sådan', 'um', 'uh', 'du ved').
-- Ret talefejl og gentagelser.
-- Formater som naturlig, sammenhængende tekst med korrekt tegnsætning og store bogstaver.
-- Lav kun punktopstilling hvis brugeren specifikt sagde 'punkt' eller 'bullet point'.
-- Hvis brugeren sagde 'ny linje', indsæt et linjeskift.
-- Skriv på fejlfrit DANSK.
-- Udskriv KUN den rensede tekst uden forklaringer eller citationstegn.{dict_suffix}<|im_end|>
-<|im_start|>user
-{text}<|im_end|>
-<|im_start|>assistant
-"""
-        elif lang == "de":
-            prompt = f"""<|im_start|>system
-Du bist ein intelligenter Diktierassistent. Bereinige das gesprochene Transkript:
-- Entferne Füllwörter ('äh', 'ähm', 'also', 'weißt du', 'quasi').
-- Korrigiere Versprecher und Wortwiederholungen flüssig.
-- Formatiere als natürlichen, zusammenhängenden Text mit korrekter Zeichensetzung und Groß-/Kleinschreibung.
-- Erstelle nur Aufzählungspunkte, wenn ausdrücklich 'Aufzählungspunkt' oder 'Punkt' diktiert wurde.
-- Wenn 'neue Zeile' oder 'Absatz' diktiert wurde, füge einen Zeilenumbruch ein.
-- Schreibe in fehlerfreiem DEUTSCH.
-- Gib NUR den bereinigten Text ohne Erklärungen oder Anführungszeichen aus.{dict_suffix}<|im_end|>
-<|im_start|>user
-{text}<|im_end|>
-<|im_start|>assistant
-"""
-        elif lang == "fr":
-            prompt = f"""<|im_start|>system
-Tu es un assistant de dictée vocale intelligent. Nettoie la transcription suivante:
-- Supprime les tics de langage et mots de remplissage ('euh', 'ben', 'tu sais', 'en fait', 'genre').
-- Corrige les hésitations et répétitions avec fluidité.
-- Formate en texte continu naturel avec ponctuation et majuscules soignées.
-- Ne crée des puces que si l'utilisateur a explicitement dit 'point' ou 'puce'.
-- Si l'utilisateur a dit 'à la ligne' ou 'nouvelle ligne', insère un saut de ligne.
-- Écris en FRANÇAIS impeccable.
-- Renvoie UNIQUEMENT le texte nettoyé sans explications ni guillemets.{dict_suffix}<|im_end|>
-<|im_start|>user
-{text}<|im_end|>
-<|im_start|>assistant
-"""
-        else:
-            prompt = f"""<|im_start|>system
-You are an intelligent voice dictation assistant. Clean up this spoken transcript:
-- Remove verbal filler words ('um', 'uh', 'you know', 'like').
-- Fix false starts and repetitions smoothly.
-- Format as natural continuous text with proper capitalization and punctuation.
-- Only create bullet points if the user explicitly dictated 'bullet point'.
-- If the user dictated 'new line', insert a line break.
-- Preserve the exact language and meaning.
-- Output ONLY the final cleaned text without explanations or quotes.{dict_suffix}<|im_end|>
-<|im_start|>user
-{text}<|im_end|>
-<|im_start|>assistant
-"""
-        try:
-            t0 = time.time()
-            if max_tokens is None:
-                # Output is roughly as long as the input; budget 1.5x + slack and
-                # never exceed what fits in the context window.
-                n_in = len(self.local_llm.tokenize(text.encode("utf-8"), add_bos=False))
-                n_prompt = len(self.local_llm.tokenize(prompt.encode("utf-8"), add_bos=False))
-                max_tokens = max(16, min(int(n_in * 1.5) + 32, self.llm_ctx - n_prompt - 8))
-            res = self.local_llm(prompt, max_tokens=max_tokens, temperature=0.1, stop=["<|im_end|>"])
-            cleaned = res["choices"][0]["text"].strip()
-            dur = time.time() - t0
-            if cleaned:
-                # Strip conversational model prefixes if any slipped through
-                for prefix in ("Here is the cleaned text:", "Cleaned text:", "Transcribed text:", "Here is the transcript:", "Sure, here is"):
-                    if cleaned.lower().startswith(prefix.lower()):
-                        cleaned = cleaned[len(prefix):].strip()
-                        if cleaned.startswith('"') and cleaned.endswith('"'):
-                            cleaned = cleaned[1:-1].strip()
-
-                # Safety check: if the model answered a question or hallucinated instead of cleaning
-                in_words = len(text.split())
-                out_words = len(cleaned.split())
-                if in_words >= 4 and (out_words > in_words * 2.5 + 10 or out_words < max(1, in_words * 0.25)):
-                    log(f"[AI Warning] Local AI output diverged suspiciously ({out_words} vs {in_words} words). Falling back to raw transcript.")
-                    return text
-
-                if not quiet:
-                    n_out = res.get("usage", {}).get("completion_tokens", 0)
-                    log(f"[Local AI {dur:.2f}s, {n_out} tokens]: \"{cleaned}\"")
-                return cleaned
-        except Exception as e:
-            log(f"[AI Warning] Local AI formatting failed ({e}). Using raw text.")
-        return text
-
-    def get_foreground_info(self):
-        hwnd = _user32.GetForegroundWindow()
-        if not hwnd:
-            return "", "", ""
-        length = _user32.GetWindowTextLengthW(hwnd)
-        buff = ctypes.create_unicode_buffer(length + 1)
-        _user32.GetWindowTextW(hwnd, buff, length + 1)
-        title = buff.value.lower()
-
-        class_buff = ctypes.create_unicode_buffer(256)
-        _user32.GetClassNameW(hwnd, class_buff, 256)
-        cls = class_buff.value.lower()
-
-        exe = ""
-        pid = wintypes.DWORD()
-        _user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-        if pid.value:
-            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-            h_proc = _kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid.value)
-            if h_proc:
-                try:
-                    exe_buf = ctypes.create_unicode_buffer(1024)
-                    size = wintypes.DWORD(1024)
-                    if _kernel32.QueryFullProcessImageNameW(h_proc, 0, exe_buf, ctypes.byref(size)):
-                        exe = os.path.basename(exe_buf.value).lower()
-                finally:
-                    _kernel32.CloseHandle(h_proc)
-        return cls, title, exe
-
-    TYPE_CHUNK = 32  # characters per SendInput call (one syscall instead of one per char)
-
-    def type_unicode_text(self, text):
-        import struct
-        events = []
-        for ch in text:
-            if ch == "\r":
-                continue
-            down = INPUT()
-            down.type = INPUT_KEYBOARD
-            up = INPUT()
-            up.type = INPUT_KEYBOARD
-            if ch == "\n":
-                down.u.ki = KEYBDINPUT(VK_RETURN, 0, 0, 0, 0)
-                up.u.ki = KEYBDINPUT(VK_RETURN, 0, KEYEVENTF_KEYUP, 0, 0)
-                events.extend((down, up))
-            else:
-                # Encode to UTF-16 LE code units to safely handle surrogate pairs for emojis/non-BMP chars
-                raw_bytes = ch.encode("utf-16-le")
-                code_units = struct.unpack(f"<{len(raw_bytes) // 2}H", raw_bytes)
-                for code in code_units:
-                    d = INPUT()
-                    d.type = INPUT_KEYBOARD
-                    d.u.ki = KEYBDINPUT(0, code, KEYEVENTF_UNICODE, 0, 0)
-                    u = INPUT()
-                    u.type = INPUT_KEYBOARD
-                    u.u.ki = KEYBDINPUT(0, code, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP, 0, 0)
-                    events.extend((d, u))
-
-        for i in range(0, len(events), self.TYPE_CHUNK * 2):
-            batch = events[i:i + self.TYPE_CHUNK * 2]
-            arr = (INPUT * len(batch))(*batch)
-            ctypes.windll.user32.SendInput(len(batch), arr, ctypes.sizeof(INPUT))
-            time.sleep(0.002)
-
-    # ---- Clipboard save / restore -------------------------------------------
-    # Pasting needs the clipboard, but it belongs to the user. Speak saves the
-    # text that was on it, pastes, and puts it back once the target app has had
-    # time to read it. Only plain text can be restored (images/files-only
-    # clipboards are left alone - same as before). Opt out with the optional
-    # config key "restore_clipboard": false.
-    CLIPBOARD_RESTORE_DELAY = 0.8   # seconds after the paste keystroke
-
-    def _open_clipboard(self, attempts=5):
-        for _ in range(attempts):
-            try:
-                win32clipboard.OpenClipboard()
-                return True
-            except Exception:
-                time.sleep(0.04)
-        return False
-
-    def _clipboard_snapshot(self):
-        """Returns {'kind': 'text'|'empty'|'other', 'text': ...} or None if disabled/unreadable."""
-        if not self.config.get("restore_clipboard", True):
-            return None
-        if not self._open_clipboard():
-            return None
-        try:
-            if win32clipboard.IsClipboardFormatAvailable(win32clipboard.CF_UNICODETEXT):
-                return {"kind": "text", "text": win32clipboard.GetClipboardData(win32clipboard.CF_UNICODETEXT)}
-            return {"kind": "empty"} if _user32.CountClipboardFormats() == 0 else {"kind": "other"}
-        except Exception:
-            return None
-        finally:
-            try:
-                win32clipboard.CloseClipboard()
-            except Exception:
-                pass
-
-    def _set_clipboard_text(self, text):
-        if not self._open_clipboard():
-            return False
-        try:
-            win32clipboard.EmptyClipboard()
-            if text is not None:
-                win32clipboard.SetClipboardText(text, win32clipboard.CF_UNICODETEXT)
-            return True
-        except Exception:
-            return False
-        finally:
-            try:
-                win32clipboard.CloseClipboard()
-            except Exception:
-                pass
-
-    def _restore_clipboard(self, token, delay=None):
-        """Put the saved clipboard back, unless something else has changed it since."""
-        if not token:
-            return
-        snapshot, our_seq, t_used = token
-        if not snapshot or snapshot["kind"] == "other":
-            return
-        wait = (self.CLIPBOARD_RESTORE_DELAY if delay is None else delay) - (time.time() - t_used)
-        if wait > 0:
-            time.sleep(wait)
-        if _user32.GetClipboardSequenceNumber() != our_seq:
-            return  # the user (or another app) copied something new - keep it
-        self._set_clipboard_text(snapshot.get("text") if snapshot["kind"] == "text" else None)
-
-    def insert_text(self, text):
-        """Inserts text into the focused app. Returns a clipboard restore token
-        (pass to _restore_clipboard) or None when the clipboard was not used."""
-        ctypes.windll.user32.keybd_event(VK_SHIFT, 0, KEYEVENTF_KEYUP, 0)
-        ctypes.windll.user32.keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0)
-        ctypes.windll.user32.keybd_event(VK_MENU, 0, KEYEVENTF_KEYUP, 0)
-        time.sleep(0.05)
-
-        cls, title, exe = self.get_foreground_info()
-        terminal_exes = {
-            "windowsterminal.exe", "wt.exe", "powershell.exe", "pwsh.exe",
-            "cmd.exe", "mintty.exe", "conhost.exe", "alacritty.exe",
-            "wezterm-gui.exe", "kitty.exe", "warp.exe"
-        }
-        terminal_classes = {
-            "consolewindowclass", "cascadia_code_window_class", "mintty"
-        }
-        is_terminal = (exe in terminal_exes) or any(tc in cls for tc in terminal_classes) or any(t in title for t in ["powershell", "cmd.exe", "wsl"])
-
-        target_desc = f"{exe or cls or title}"
-        if self.paste_mode == "typing" or (self.paste_mode == "auto" and is_terminal and len(text) < 400):
-            log(f"[Insert] Using Direct Unicode Typing (Target: '{target_desc}')...")
-            self.type_unicode_text(text)
-            return None
-
-        snapshot = self._clipboard_snapshot()
-        if not self._set_clipboard_text(text):
-            log("[Insert Warning] Could not write to the clipboard (held by another app); pasting anyway.")
-            snapshot = None
-        our_seq = _user32.GetClipboardSequenceNumber()
-
-        time.sleep(0.05)
-
-        if is_terminal and "consolewindowclass" in cls:
-            log("[Insert] Using Shift+Insert for classic console...")
-            ctypes.windll.user32.keybd_event(VK_SHIFT, 0, 0, 0)
-            ctypes.windll.user32.keybd_event(VK_INSERT, 0, 0, 0)
-            time.sleep(0.03)
-            ctypes.windll.user32.keybd_event(VK_INSERT, 0, KEYEVENTF_KEYUP, 0)
-            ctypes.windll.user32.keybd_event(VK_SHIFT, 0, KEYEVENTF_KEYUP, 0)
-        else:
-            log(f"[Insert] Using Clipboard Paste (Target: '{cls or title}')...")
-            ctypes.windll.user32.keybd_event(VK_CONTROL, 0, 0, 0)
-            ctypes.windll.user32.keybd_event(VK_V, 0, 0, 0)
-            time.sleep(0.03)
-            ctypes.windll.user32.keybd_event(VK_V, 0, KEYEVENTF_KEYUP, 0)
-            ctypes.windll.user32.keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0)
-        return (snapshot, our_seq, time.time()) if snapshot else None
 
     LEARN_HOTKEY_ID = 9
     MEETING_HOTKEY_ID = 10
@@ -1166,16 +578,13 @@ You are an intelligent voice dictation assistant. Clean up this spoken transcrip
             threading.Thread(target=self.play_sound, args=("error",), daemon=True).start()
             return
 
-        for vk in (VK_SHIFT, VK_CONTROL, VK_MENU):
-            ctypes.windll.user32.keybd_event(vk, 0, KEYEVENTF_KEYUP, 0)
-        time.sleep(0.05)
-        snapshot = self._clipboard_snapshot()
+        # The user may still be holding Ctrl+Alt from the hotkey: wait for the
+        # release, or the app receives Ctrl+Alt+C instead of Ctrl+C.
+        self._release_modifiers(timeout=0.6)
+        inherited = self._take_pending_restore()
+        snapshot = inherited[0] if inherited else self._clipboard_snapshot()
         seq_before = _user32.GetClipboardSequenceNumber()
-        ctypes.windll.user32.keybd_event(VK_CONTROL, 0, 0, 0)
-        ctypes.windll.user32.keybd_event(0x43, 0, 0, 0)  # 'C'
-        time.sleep(0.03)
-        ctypes.windll.user32.keybd_event(0x43, 0, KEYEVENTF_KEYUP, 0)
-        ctypes.windll.user32.keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0)
+        send_keys(chord(VK_CONTROL, VK_C))
 
         # Wait for the app to actually copy (sequence number changes). Without
         # this, an empty selection made Speak diff stale clipboard contents.
@@ -1199,7 +608,9 @@ You are an intelligent voice dictation assistant. Clean up this spoken transcrip
                         win32clipboard.CloseClipboard()
                     except Exception:
                         pass
-            # The selection was only borrowed - give the user their clipboard back.
+        if copied or inherited is not None:
+            # The selection was only borrowed, or a dictation was still on the
+            # clipboard waiting for its restore: give the user their clipboard back.
             self._restore_clipboard((snapshot, _user32.GetClipboardSequenceNumber(), time.time()), delay=0)
 
         if not corrected or not corrected.strip():
@@ -1209,8 +620,10 @@ You are an intelligent voice dictation assistant. Clean up this spoken transcrip
 
         added = self.dictionary.learn_from_correction(self.last_inserted_text, corrected)
         if added:
+            saved = ("NOT saved: the dictionary file could not be read at startup, restart Speak"
+                     if self.dictionary.read_only else "saved to personal dictionary")
             for heard, new in added:
-                log(f"[Learned] '{heard}' -> '{new}'  (saved to personal dictionary, {len(self.dictionary)} words)")
+                log(f"[Learned] '{heard}' -> '{new}'  ({saved}, {len(self.dictionary)} words)")
             log("          Whisper will now be primed with this spelling; the mishearing is auto-replaced once confirmed.")
             threading.Thread(target=self.play_sound, args=("success",), daemon=True).start()
         else:
@@ -1258,8 +671,10 @@ You are an intelligent voice dictation assistant. Clean up this spoken transcrip
             hotkeys_to_bind.append((self.MEETING_HOTKEY_ID, mods | MOD_NOREPEAT, vk, f"Record meeting ({self.meetings.hotkey})"))
 
         success_count = 0
+        self.hotkey_vks = {}
         for hid, mods, vk_code, desc in hotkeys_to_bind:
             if _user32.RegisterHotKey(None, hid, mods, vk_code):
+                self.hotkey_vks[hid] = vk_code
                 if hid in (self.LEARN_HOTKEY_ID, self.MEETING_HOTKEY_ID):
                     self.registered_ids.append(hid)
                     log(f"[Hotkey Registered] {desc} -> ACTIVE")
@@ -1277,6 +692,7 @@ You are an intelligent voice dictation assistant. Clean up this spoken transcrip
             f8_vk = FUNCTION_KEYS["F8"]
             if _user32.RegisterHotKey(None, 1, MOD_NONE | MOD_NOREPEAT, f8_vk):
                 self.registered_ids.append(1)
+                self.hotkey_vks[1] = f8_vk
                 log("[Hotkey Registered] Fallback to F8 -> ACTIVE")
 
     def unregister_hotkeys(self):
@@ -1307,6 +723,17 @@ You are an intelligent voice dictation assistant. Clean up this spoken transcrip
 
     def _listener_loop(self):
         self.register_hotkeys()
+        if self.config.get("tray_icon", True):
+            # On this thread: its message loop delivers the icon's clicks.
+            self.tray = TrayIcon({
+                "dictation": lambda: threading.Thread(target=self.toggle_recording, daemon=True).start(),
+                "meeting": lambda: threading.Thread(target=self.meetings.toggle, daemon=True).start(),
+                "show": show_console,
+                "quit": self._quit_from_tray,
+                "status": lambda: (self.is_recording, self.meetings.is_recording),
+            })
+            if not self.tray.create():
+                self.tray = None
         msg = wintypes.MSG()
         while self.running:
             if self.hotkey_rebind_event.is_set():
@@ -1314,18 +741,32 @@ You are an intelligent voice dictation assistant. Clean up this spoken transcrip
                 self.unregister_hotkeys()
                 self.register_hotkeys()
 
-            if ctypes.windll.user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, PM_REMOVE):
+            # Handle every queued message, not one per 20 ms.
+            while _user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, PM_REMOVE):
                 if msg.message == WM_HOTKEY:
                     if msg.wParam == self.LEARN_HOTKEY_ID:
                         threading.Thread(target=self.learn_from_selection, daemon=True).start()
                     elif msg.wParam == self.MEETING_HOTKEY_ID:
                         threading.Thread(target=self.meetings.toggle, daemon=True).start()
+                    elif self.config.get("hotkey_mode") == "hold":
+                        vk = self.hotkey_vks.get(msg.wParam)
+                        threading.Thread(target=self.hold_to_talk, args=(vk,), daemon=True).start()
                     else:
                         self.toggle_recording()
-                ctypes.windll.user32.TranslateMessage(ctypes.byref(msg))
-                ctypes.windll.user32.DispatchMessageW(ctypes.byref(msg))
+                _user32.TranslateMessage(ctypes.byref(msg))
+                _user32.DispatchMessageW(ctypes.byref(msg))
             time.sleep(0.02)
         self.unregister_hotkeys()
+        if self.tray is not None:
+            self.tray.destroy()
+
+    def _quit_from_tray(self):
+        """The tray menu's Quit: the same shutdown as typing q. The console
+        is waiting in input(), which cannot be woken cleanly, so the process
+        ends here once everything is saved."""
+        log("\nQuitting (from the tray icon)...")
+        self.shutdown()
+        os._exit(0)
 
     def get_ai_status_str(self):
         if self.ai_mode == "local" and self.local_llm:
@@ -1343,7 +784,10 @@ You are an intelligent voice dictation assistant. Clean up this spoken transcrip
         log("\n" + "=" * 68)
         log("                   SPEAK - LOCAL VOICE-TO-TEXT                 ")
         log("=" * 68)
-        log(f"Active Hotkey  : [{self.hotkey_req}] (Tap to start, Tap to stop & paste)")
+        if self.config.get("hotkey_mode") == "hold":
+            log(f"Active Hotkey  : [{self.hotkey_req}] (Hold while you speak, or tap to start and tap to stop)")
+        else:
+            log(f"Active Hotkey  : [{self.hotkey_req}] (Tap to start, Tap to stop & paste)")
         log(f"Whisper Model  : faster-whisper-{self.model_size} (Local CPU int8)")
         log(f"Whisper Path   : {self.model_storage_path} ({size_str})")
         log(f"AI Formatting  : {ai_status}")
@@ -1428,7 +872,22 @@ You are an intelligent voice dictation assistant. Clean up this spoken transcrip
             except Exception as e:
                 log(f"Could not open the folder: {e}")
 
+    def _on_console_close(self, event):
+        """Windows' console control handler. Closing the window, logging off
+        or shutting down ends the process right after this returns: save a
+        running meeting and remove the tray icon first. Ctrl+C is left to
+        Python (it stops the menu loop)."""
+        if event in (2, 5, 6):   # CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT
+            try:
+                self.shutdown(wait=3.0)   # Windows ends the process about 5 s after this starts
+            except Exception:
+                pass
+            return True
+        return False
+
     def run(self, first_run=False):
+        self._console_handler = _CONSOLE_HANDLER(self._on_console_close)   # kept alive: Windows calls it
+        _kernel32.SetConsoleCtrlHandler(self._console_handler, True)
         listener_thread = threading.Thread(target=self._listener_loop, daemon=True)
         listener_thread.start()
 
@@ -1455,9 +914,17 @@ You are an intelligent voice dictation assistant. Clean up this spoken transcrip
                     log("  >   - Shift + the key next to Left Shift")
                     log("  <>  - Either plain tap OR Shift tap triggers dictation")
                     log("  F8, F9, F10, Pause, CapsLock, Insert")
-                    new_h = input("Enter new hotkey [< / > / <> / F8 / etc.]: ").strip()
+                    new_h = input("Enter new hotkey [< / > / <> / F8 / etc.] (Enter keeps it): ").strip()
                     if new_h:
                         self.set_hotkey(new_h)
+                    hold = self.config.get("hotkey_mode") == "hold"
+                    log("Hold to talk: hold the hotkey while you speak and release it to insert the text.")
+                    log("A short tap still starts a dictation that the next tap ends.")
+                    answer = input(f"Hold to talk? [y/n] (now {'on' if hold else 'off'}, Enter keeps it): ").strip().lower()
+                    if answer in ("y", "yes", "n", "no"):
+                        self.config["hotkey_mode"] = "hold" if answer.startswith("y") else "toggle"
+                        save_config(self.config)
+                        log(f"[HOTKEY] Hold to talk is {'on' if answer.startswith('y') else 'off'} (saved).")
                     self.print_status_banner()
 
                 elif cmd in ("a", "ai", "format"):
@@ -1488,8 +955,9 @@ You are an intelligent voice dictation assistant. Clean up this spoken transcrip
                         save_config(self.config)
                         self.init_ai()
                     elif sub == "4":
-                        log("\n[Testing] Testing with: 'uh I think we should bullet point deploy the change new line bullet point notify the team'...")
-                        test_out = self.format_text("uh I think we should bullet point deploy the change new line bullet point notify the team", "en")
+                        log("\n[Testing] Testing with: 'uh I think we should, bullet point deploy the change, bullet point notify the team'...")
+                        with self.engine_lock:   # shared with dictation and meeting cleanup
+                            test_out = self.clean_text("uh I think we should, bullet point deploy the change, bullet point notify the team", "en")
                         log(f"[Result]:\n{test_out}")
                     self.print_status_banner()
 
@@ -1515,6 +983,8 @@ You are an intelligent voice dictation assistant. Clean up this spoken transcrip
                     log("  c - Clear the whole dictionary")
                     log(f"  Tip: after dictating, fix any wrong word in your app, select the sentence and tap {self.learn_hotkey_req}.")
                     log("  Enter - Return to main menu")
+                    if self.dictionary.read_only:
+                        log("  Note: the dictionary file could not be read at startup. Changes last until you restart Speak and are not saved.")
                     sub = input("Choose option [a/r/i/c]: ").strip().lower()
                     if sub == "a":
                         raw = input("Words to add: ").strip()
@@ -1550,9 +1020,9 @@ You are an intelligent voice dictation assistant. Clean up this spoken transcrip
 
                 elif cmd in ("m", "model"):
                     log("\n--- CHANGE WHISPER MODEL ---")
-                    log("Options: medium (high accuracy, recommended), base (faster), small, tiny")
-                    new_m = input("Enter model size [tiny/base/small/medium]: ").strip().lower()
-                    if new_m in ("tiny", "base", "small", "medium"):
+                    log("Options: medium (high accuracy, recommended), base (faster), small, tiny, large-v3 (most accurate, slow on CPU)")
+                    new_m = input("Enter model size [tiny/base/small/medium/large-v3]: ").strip().lower()
+                    if new_m in WHISPER_MODELS:
                         target_dir = os.path.join(MODELS_DIR, f"models--Systran--faster-whisper-{new_m}")
                         if not os.path.exists(target_dir):
                             confirm = input(f"Model '{new_m}' is not bundled locally. Download now via Hugging Face? (y/N): ").strip().lower()
@@ -1611,14 +1081,49 @@ You are an intelligent voice dictation assistant. Clean up this spoken transcrip
         except KeyboardInterrupt:
             pass
         finally:
+            self.shutdown()
+
+    def shutdown(self, wait=30.0):
+        """Stops Speak: the tray icon and hotkeys go first (milliseconds), a
+        dictation being recorded is kept, a running meeting is saved for
+        later, dictations already spoken are typed in (for up to `wait`
+        seconds) and the user's clipboard is given back. One shutdown at a
+        time: a second caller waits for the first to finish."""
+        with self.lock:
+            first = not self._shut_down
+            self._shut_down = True
+        if not first:
+            self._shutdown_done.wait(wait + 10)
+            return
+        try:
             self.running = False
-            self.meetings.shutdown()
+            if self.tray is not None:
+                self.tray.remove()   # the window itself belongs to the listener thread
             self.unregister_hotkeys()
+            if self.is_recording:
+                self.stop_recording()   # what is being said is queued like any dictation
+            self.meetings.shutdown()
+            deadline = time.monotonic() + wait
+            if self.jobs.unfinished_tasks and wait > 0:
+                log(f"Finishing {self.jobs.unfinished_tasks} dictation(s) first... (Ctrl+C skips)")
             try:
-                self.jobs.put(None)
-            except Exception:
-                pass
-            log("Speak stopped. Goodbye!")
+                while self.jobs.unfinished_tasks and time.monotonic() < deadline:
+                    time.sleep(0.1)
+                if self._pending_restore is not None:
+                    # The target app may not have pasted yet: wait as a normal restore does.
+                    time.sleep(self.CLIPBOARD_RESTORE_DELAY)
+            except KeyboardInterrupt:
+                log("Skipped.")
+        finally:
+            try:
+                self.flush_clipboard_restore()
+            finally:
+                try:
+                    self.jobs.put(None)
+                except Exception:
+                    pass
+                self._shutdown_done.set()
+                log("Speak stopped. Goodbye!")
 
 
 if __name__ == "__main__":
@@ -1627,7 +1132,7 @@ if __name__ == "__main__":
                         help="Set global hotkey (e.g. '<', '>', '<>', 'F8', 'Pause'). Default reads from config.")
     parser.add_argument("--paste-mode", default=None, choices=["auto", "typing", "clipboard"],
                         help="Paste mode: 'auto', 'typing' (direct typewriter), or 'clipboard'.")
-    parser.add_argument("--model", default=None, choices=["tiny", "base", "small", "medium", "large-v3"],
+    parser.add_argument("--model", default=None, choices=WHISPER_MODELS,
                         help="Whisper model size. Default reads from config.")
     parser.add_argument("--language", default=None, choices=["en", "da", "de", "fr", "auto"],
                         help="Language code ('en', 'da', 'de', 'fr', 'auto'). Default reads from config.")
@@ -1647,7 +1152,7 @@ if __name__ == "__main__":
         # Runs next to a Speak window too: no hotkeys, no mutex, config not saved.
         cfg = load_config()
         cfg["warm_up"] = False
-        app = SpeakApp(cfg)
+        app = SpeakApp(cfg, load_speech_model=False)
         try:
             app.meetings.process(os.path.abspath(args.transcribe_meeting))
         except Exception as e:

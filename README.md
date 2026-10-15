@@ -30,6 +30,8 @@ Everything runs on your own CPU. No audio or text leaves your computer, there is
 - **Multilingual.** English, Danish, German and French, auto-detected or locked to one language.
 - **Learns your words.** Add names, products and jargon to a personal dictionary. If Speak mishears a word, fix it in your document, select the sentence, press **Ctrl+Alt+L**, and Speak remembers the correction.
 - **Meeting transcripts.** Press **Ctrl+Alt+M** to record a Teams, Zoom or in-room meeting. Speak writes a transcript that shows who said what (*Me*, *Person 1*, *Person 2*...), with a summary and action items. Also offline.
+- **Tap or hold.** Tap the hotkey to start and again to stop, or switch on *hold to talk* and speak while you hold it. Speak can also stop by itself after a few seconds of silence.
+- **Always visible.** An icon in the notification area shows whether Speak is ready, listening, writing or recording a meeting, with a menu to start, stop or quit.
 - **No admin rights.** Runs entirely in Windows user space, with no services, drivers or firewall prompts.
 - **Fast on a laptop CPU.** Short phrases appear in about 1 second, and longer dictations in about 2 to 3 seconds.
 
@@ -136,6 +138,20 @@ Type these in the Speak window:
 
 Command-line options: `--hotkey`, `--model`, `--language`, `--paste-mode`, `--ai-mode`. Run `speak --help` for details.
 
+### Spoken commands
+
+Say these while you dictate, after a short pause:
+
+| Say | Danish | German | French | Result |
+| :--- | :--- | :--- | :--- | :--- |
+| *new line* | *ny linje* | *neue Zeile* | *à la ligne*, *nouvelle ligne* | Line break |
+| *new paragraph*, *next paragraph* | *nyt afsnit* | *neuer Absatz* | *nouveau paragraphe* | Empty line |
+| *bullet point* | *punkt* | *Aufzählungspunkt* | *puce* | New line starting with `- ` |
+| *scratch that*, *delete that* (as a sentence of its own) | *slet det* | *streich das* | *efface ça* | Deletes the sentence before it |
+| *no wait*, *sorry* | *nej vent* | *nein warte* | *non attends* | Keeps only the correction: *"on Tuesday, no wait, Wednesday"* becomes *"on Wednesday"* |
+
+*New line*, *bullet point* and *scratch that* work only as commands: *"our new line of candles"* stays as it is. Speak applies those itself when Whisper wrote a pause (a comma or full stop) before them, and *punkt* or *puce* when it starts a sentence (*"Punkt opdater prislisten."*, but not *"Punkt 3 er vigtigt."*). Otherwise, and for the corrections, the AI step does it. With AI cleanup turned off (`a`, then `3`), Speak inserts exactly what Whisper heard.
+
 ## Personal dictionary
 
 Speak keeps your word list in `speak_dictionary.json`, next to `speak.py`. It never leaves your PC.
@@ -149,7 +165,11 @@ What Speak does with your words:
 
 1. **Whisper is primed** with your dictionary before every dictation, so it hears the right spelling in the first place.
 2. **Learned mishearings are corrected automatically** once they are confirmed: when the same context appears again, or after three corrections. Until then the AI cleanup gets a one-line hint.
-3. **Exact casing is enforced** for multi-word and unusually cased entries (`øresund bridge` becomes `Øresund Bridge`, `sap` becomes `SAP`).
+3. **Exact casing is enforced** for multi-word and unusually cased entries (`øresund bridge` becomes `Øresund Bridge`, `sap` becomes `SAP`). An entry written all in lowercase (`excel`) never removes the capital at the start of a sentence.
+
+A dictionary word in a short phrase does not slow it down: the AI step only runs for it when there is something only the AI can fix (a mishearing that is not confirmed yet, or a name such as *mette* that needs its capital).
+
+Add the words Whisper gets wrong (names, products, jargon), not everyday words. Every entry nudges Whisper towards hearing it, and a capitalized everyday word (*Service*) gets capitalized in the middle of sentences.
 
 Auto-learn ignores rewrites (more than half the words changed), everyday words, and anything shorter than three letters.
 
@@ -173,10 +193,12 @@ The transcript file has the date, length and speakers at the top, then a **summa
 
 How it works:
 
+- **Devices that come and go:** if your headset drops out, switches profile or is plugged in during the meeting, Speak keeps recording. It reopens the microphone and the call audio, follows the call when Windows moves the sound to other speakers, and fills the missed seconds with silence, so both recordings stay lined up. The transcript notes when a device was out for 3 seconds or more, since what was said then may be missing.
+- **Clock drift:** the microphone and the call audio run on different hardware clocks, which drift apart by up to a second an hour. Speak measures this during the recording and lines them up again before transcribing, so long meetings keep the right speaker order and echo removal.
 - **Who spoke when:** [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) speaker diarization (pyannote segmentation and NeMo TitaNet speaker embeddings, about 47 MB, no PyTorch). Speakers that match your voice sample become *Me*, everyone else *Person 1*, *Person 2* and so on, numbered in order of appearance.
 - **What was said:** Whisper `small` (more accurate on long, mixed audio than the dictation model). Each speaker's language is detected separately, so a Danish colleague stays Danish in an English meeting.
-- **Cleanup:** only turns with fillers or stutters go to Qwen, with a strict "do not rephrase" prompt. If the model changes the meaning anyway, the turn is kept as spoken.
-- **Decisions and action items:** Speak finds the sentences where someone promises something (*"I will"*, *"jeg vil"*), asks for something (*"can you"*, *"kan du"*) or agrees on something (*"let us"*, *"lad os"*). Qwen then rewrites each one as a short to-do with its deadline. The owner comes from the transcript, not from the AI: whoever made the promise, or whoever said yes to a request. A request nobody agreed to is listed with who raised it. Every item shows when it was said, so you can check it.
+- **Cleanup:** only turns with fillers or stutters go to Qwen, which may remove only those. Spoken commands are not applied in meetings. If the model drops or changes a word anyway, the turn is kept as spoken.
+- **Decisions and action items:** Speak finds the sentences where someone promises something (*"I will"*, *"jeg vil"*, *"jeg tjekker det"*, *"leave it with me"*; but not a habit such as *"jeg tjekker altid mails"* or a refusal such as *"det gør jeg ikke"*), asks for something (*"can you"*, *"kan du"*) or agrees on something (*"let us"*, *"lad os"*). Qwen then rewrites each one as a short to-do with its deadline. The owner comes from the transcript, not from the AI: whoever made the promise, or whoever said yes to a request. A request nobody agreed to is listed with who raised it. Every item shows when it was said, so you can check it.
 - **Summary:** Qwen writes a short summary paragraph. It is a small model, so read it before you forward it.
 
 Tips:
@@ -194,14 +216,19 @@ Settings are saved to `speak_config.json` when you change them in the app. You c
 | :--- | :--- | :--- |
 | `hotkey` | `<` | Dictation hotkey |
 | `learn_hotkey` | `CTRL+ALT+L` | Hotkey that learns a correction |
-| `model` | `base` | Whisper model: `tiny`, `base`, `small`, `medium` |
+| `model` | `base` | Whisper model: `tiny`, `base`, `small`, `medium`, `large-v3` (most accurate, slow on a laptop CPU) |
 | `language` | `null` | `null` for auto-detect, or `en`, `da`, `de`, `fr` |
+| `language_check_short_phrases` | `true` | For phrases of up to 4 seconds that Whisper hears as another language than your last one, also try your last language, and keep it if Whisper is clearly more sure of it. `true` does this on `tiny` and `base` only (measured on `medium`, the check fixed nothing and cost 3.4 s), `"always"` on every model, `false` never |
 | `ai_mode` | `local` | `local` (Qwen) or `off` (raw Whisper) |
 | `local_model` | `1.5b` | `1.5b` or `0.5b` |
 | `paste_mode` | `auto` | `auto`, `typing` or `clipboard` |
 | `whisper_threads` | `4` | CPU threads for Whisper |
 | `llm_threads` | `6` | CPU threads for Qwen |
-| `llm_fast_path` | `true` | Skip the AI step for short, clean phrases |
+| `hotkey_mode` | `toggle` | `toggle`: tap to start, tap to stop. `hold`: hold the hotkey while you speak and release it to insert; a short tap still works as a toggle. Also in the `h` menu |
+| `auto_stop_silence_seconds` | `0` | Stop a dictation by itself after this many seconds without speech, once you have spoken (1 or more; `0` turns it off). Not while you hold the hotkey in hold-to-talk mode |
+| `tray_icon` | `true` | An icon in the notification area: Speak's icon when ready, a red dot while it listens, an orange dot while it writes, a purple dot during a meeting. Right-click it to start or stop a dictation or meeting, show the window or quit (while that menu is open, the hotkeys wait). Clicking the icon brings the Speak window to the front; in Windows Terminal that works only while Speak is the active tab |
+| `live_transcription` | `true` | Long dictations (over about 20 seconds) are transcribed in pieces while you speak, so after you stop only the last piece is left. Shorter ones are not affected |
+| `llm_fast_path` | `true` | Skip the AI step for short, clean phrases. A filler at the start (*um*, *øh*) does not stop a phrase from counting as clean: Speak removes it itself (in German, *um* is a word and stays) |
 | `warm_up` | `true` | Warm up both models at startup so the first dictation is fast |
 | `high_priority` | `true` | Run at above-normal priority so busy apps do not slow processing down |
 | `meeting_hotkey` | `CTRL+ALT+M` | Hotkey that starts and stops a meeting recording |
@@ -224,12 +251,17 @@ Measured on an Intel Core Ultra 7 265U with `faster-whisper-base` and Qwen 2.5 1
 
 | Optimization | Effect |
 | :--- | :--- |
+| Whisper keeps its timestamps | Without them Whisper often stopped after the first sentence that ended in a pause: of a 69-second dictation only 17 of 115 words came out, of a 21-second one 10 of 54. With them every word comes out, at the same speed |
+| Long dictations transcribed and cleaned while you speak | Whisper works on a fixed 30-second window, so a short dictation cannot be sped up this way (its last 3 seconds take 80 to 90% of the whole). A dictation longer than about 20 seconds is cut at a pause (or, if you do not pause, at a breath) and each piece is transcribed and cleaned while you go on speaking; after you stop, only the last piece is left. Pieces cut at a breath, or that start with a command or a correction (*"no wait"*, *"scratch that"*, *"new line"*), are cleaned together, so the result is the same as in one go |
 | One encoder pass for language detection and transcription | Whisper stage **40 to 60% faster** (faster-whisper otherwise encodes the same 30 s window twice) |
-| Fast path for short, clean phrases (8 words or fewer, no fillers, commands or numbers) | Language model skipped, text inserted in about 1 s |
+| Fast path for short, clean phrases (8 words or fewer, no fillers, commands or numbers). A filler at the start is removed by Speak itself, and filler lists are per language ("er" is a filler in English, "is" in Danish) | Language model skipped. In the benchmark, all short phrases now skip it (was about half), and they are inserted about 40% faster |
+| Clipboard restored on a timer after a paste | The next dictation no longer waits 0.8 s after every paste |
+| Short-phrase language check | A phrase of up to 4 s that Whisper hears as another language than your last one is decoded in both, greedily. Fixes short phrases such as *"Det er fint med mig"* that Whisper hears as German. Costs about 0.2 to 0.3 s on `base`, only when the languages disagree. Off by default on `small` and larger: measured on `medium`, it fixed nothing and cost 3.4 s |
 | Engines warmed up at startup | The first dictation is as fast as the rest |
 | `ABOVE_NORMAL` process priority | Chrome, Teams and Outlook cannot take the CPU during the ~2 s of processing |
 | Direct typing sends 32 characters per `SendInput` call | Insertion into terminals is about 20x faster |
-| Long dictations cleaned in sentence-aligned chunks | No silent truncation after about 100 words |
+| One cleanup prompt for all four languages, with worked examples. Speak itself removes filler sounds and applies *new line*, *bullet point* and *scratch that* before the AI runs, and rejects any AI output that drops, adds or translates words | On a set of 39 dictations and meeting turns, word errors after cleanup fell from 17% to under 1%: the old per-language prompts dropped *"I think"*, *"please"* and introduction lines, and missed half the line breaks. Each AI call is also about 15% faster: the prompt stays cached when you switch language |
+| Long dictations cleaned in sentence-aligned chunks (at line breaks first, at commas, or in equal pieces of up to 160 words, when Whisper wrote no full stops; the AI may then start a new sentence at such a split) | No silent truncation after about 100 words |
 
 Tested and rejected (kept as opt-in config keys): prompt-lookup speculative decoding (`speculative_decoding`, 2.5x *slower* on CPU with llama-cpp-python 0.3.x), flash attention (no gain), and Whisper `hotwords` (makes multi-word names stutter). On hybrid P/E-core CPUs, more Whisper threads were consistently *slower*.
 
@@ -237,10 +269,16 @@ Tested and rejected (kept as opt-in config keys): prompt-lookup speculative deco
 
 ```text
 Speak/
-├── speak.py                  # The app: recording, transcription, AI cleanup, text insertion
+├── speak.py                  # The app: hotkeys, recording, the menu
+├── speak_engines.py          # Speech-to-text (Whisper) and AI cleanup (Qwen)
+├── speak_insert.py           # Putting text into the active window (paste or typing)
+├── speak_base.py             # Paths, the log, Windows handles shared by the modules
+├── speak_tray.py             # The notification-area icon and its menu
 ├── speak_dictionary.py       # Personal dictionary and learning from corrections
+├── speak_text.py             # Text rules: fast path, fillers, filter for text Whisper invents
 ├── speak_meeting.py          # Meeting mode: recording, speaker detection, transcript, summary
 ├── test_speak.py             # Unit tests
+├── bench/                    # Speed and accuracy benchmark with synthetic voice clips
 ├── requirements.txt          # Python dependencies
 ├── install.ps1               # Installer, updater and uninstaller (no admin rights)
 ├── setup.cmd                 # Double-click to run install.ps1 in this folder
@@ -259,8 +297,30 @@ Speak/
 ## Running the tests
 
 ```powershell
-.venv\Scripts\python test_speak.py
+.venv\Scripts\python -m unittest test_speak
 ```
+
+## Benchmark
+
+`bench/` measures speed and accuracy on 33 clips (English, Danish, German and French speech, and three clips with no speech at all). The clips are made with Windows and [Piper](https://github.com/rhasspy/piper) voices, so no real person's voice is recorded. The benchmark runs the real dictation pipeline but types nothing, never writes your settings and does not use your personal dictionary. It uses an empty one, or a copy of the file you pass with `--dictionary`: `bench\dictionary_common.json` mixes names, acronyms and everyday words, like a real dictionary.
+
+```powershell
+.venv\Scripts\python -X utf8 bench\run_bench.py --label my-change --repeat 3
+.venv\Scripts\python -X utf8 bench\run_bench.py --scenario other      # you just switched language
+.venv\Scripts\python -X utf8 bench\run_bench.py --set model=medium --dictionary bench\dictionary_common.json
+.venv\Scripts\python -X utf8 bench\run_bench.py --compare bench\results\A.json bench\results\B.json
+```
+
+It reports the word error rate (WER) per language and clip type, how often the language was detected correctly, how often the AI step was skipped, the time per stage, and any text invented on the no-speech clips. Whisper and Qwen use fixed random seeds, so most clips give the same text every run. A few hard clips do not: when Whisper is unsure it re-decodes with random sampling, which the seed does not fully control. Expect the overall WER to move by about 1.5 points between identical runs, and look at which clips changed (`--compare`) before trusting a small difference. Timings depend on what else the computer is doing: compare runs made one after the other. To rebuild the clips, see `bench\make_clips.py`.
+
+Two more benchmarks use the same clips:
+
+```powershell
+.venv\Scripts\python -X utf8 bench\run_cleanup_bench.py                      # the AI cleanup alone, on fixed transcripts (2 minutes)
+.venv\Scripts\python -X utf8 bench\run_live_bench.py --model medium --live on en da   # long dictations, in real time
+```
+
+`run_cleanup_bench.py` scores the cleanup step (commands, corrections, fillers, meeting turns) without audio, for tuning the prompt. `run_live_bench.py` plays each language's clips one after the other into Speak through a simulated microphone, in real time, and reports the time from the stop to the text: compare `--live on` with `--live off`.
 
 ## Privacy
 

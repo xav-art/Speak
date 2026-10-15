@@ -21,6 +21,8 @@ How the dictionary is used in the pipeline (see speak.py):
                present in the transcript, a one-line hint is appended to the
                cleanup prompt. Ordinary dictations keep the exact prompt the
                user has tuned - Qwen 1.5B is sensitive to prompt changes.
+               The hint alone does not make a short phrase wait for Qwen:
+               only what step 4 cannot fix does (see prepare()).
 4. Post-LLM  : exact casing is enforced for multi-word / oddly-cased entries
                ('øresund bridge' -> 'Øresund Bridge', 'sap' -> 'SAP').
 """
@@ -97,6 +99,23 @@ def _fold(s):
 
 def _word_pattern(word):
     return re.compile(r"(?<!\w)" + re.escape(word).replace(r"\ ", r"\s+") + r"(?!\w)", re.IGNORECASE)
+
+
+# Opening quotes, brackets and bullet marks that can stand before the first
+# word of a sentence ('- Machine learning...', '"Machine learning..."').
+_OPENERS = "\"'\u201c\u201d\u2018\u2019\u201e\u00ab\u00bb([{-\u2013\u2022*\u00b7"
+_CLOSERS = "\"'\u201c\u201d\u2018\u2019\u00ab\u00bb)]}"
+
+
+def _at_sentence_start(text, pos):
+    """True when position pos starts the text, a line, a sentence, a bullet
+    or a quote, or follows a colon or an ellipsis."""
+    before = text[:pos]
+    core = before.rstrip().rstrip(_OPENERS).rstrip()
+    if not core or "\n" in before[len(core):]:
+        return True
+    closed = core.rstrip(_CLOSERS)   # '(See above.) Machine learning'
+    return bool(closed) and closed[-1] in ".!?:\u2026"
 
 
 def find_edited_region(original, field_value):
@@ -241,6 +260,11 @@ class Dictionary:
     def __init__(self, base_dir):
         self.path = os.path.join(base_dir, DICTIONARY_FILE)
         self.lock = threading.Lock()
+        # Held across the whole save: two threads writing the same .tmp file
+        # (the worker's usage counts and the learn hotkey, say) interleave
+        # their bytes and can move a broken file into place.
+        self._save_lock = threading.Lock()
+        self._read_failed = False   # set by load(): then save() never writes
         self.entries = {}      # fold(word)  -> {"word", "source", "uses", "added"}
         self.corrections = {}  # fold(heard) -> {"heard", "word", "count", "contexts": [...]}
         self.load()
@@ -250,17 +274,59 @@ class Dictionary:
     def load(self):
         if not os.path.exists(self.path):
             return
-        try:
-            with open(self.path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-        except Exception:
-            return
+        data = None
+        for attempt in range(5):
+            try:
+                with open(self.path, "r", encoding="utf-8") as f:
+                    entries, corrections = self._parse(json.load(f))
+                break
+            except FileNotFoundError:
+                return   # deleted meanwhile: nothing to keep, start empty
+            except OSError as e:
+                # Locked for a moment (antivirus, backup, another Speak saving).
+                if attempt < 4:
+                    time.sleep(0.1)
+                    continue
+                # Never overwrite a file that could not be read.
+                self._read_failed = True
+                print(f"[Dictionary Warning] {DICTIONARY_FILE} could not be opened ({e}). "
+                      f"Speak runs without your words and will not save changes until restarted.", flush=True)
+                return
+            except (ValueError, TypeError, AttributeError, KeyError) as e:
+                # Broken content (bad JSON, or JSON of the wrong shape).
+                # Starting empty would overwrite it at the next save: keep it
+                # aside, like load_config does.
+                backup = f"{self.path}.corrupt-{time.strftime('%Y%m%d-%H%M%S')}"
+                n = 1
+                while os.path.exists(backup):   # never replace an earlier backup
+                    n += 1
+                    backup = f"{self.path}.corrupt-{time.strftime('%Y%m%d-%H%M%S')}-{n}"
+                try:
+                    os.replace(self.path, backup)
+                except OSError:
+                    self._read_failed = True
+                    backup = None
+                print(f"[Dictionary Warning] {DICTIONARY_FILE} could not be read ({e}). "
+                      + (f"It was kept as {backup}; starting with an empty dictionary." if backup
+                         else "Speak will not save changes until restarted."), flush=True)
+                return
+        self.entries, self.corrections = entries, corrections
+
+    @staticmethod
+    def _parse(data):
+        """File content -> (entries, corrections). Raises ValueError,
+        TypeError, AttributeError or KeyError when the shape is wrong."""
+        if not isinstance(data, dict):
+            raise ValueError("not a dictionary file")
+        if not isinstance(data.get("words", []), list) or not isinstance(data.get("corrections", []), list):
+            raise ValueError("'words' and 'corrections' must be lists")
+        entries, corrections = {}, {}
         for e in data.get("words", []):
             if isinstance(e, str):
                 e = {"word": e}
             w = str(e.get("word", "")).strip()
             if w:
-                self.entries[_fold(w)] = {
+                entries[_fold(w)] = {
                     "word": w,
                     "source": e.get("source", "manual"),
                     "uses": int(e.get("uses", 0)),
@@ -270,24 +336,49 @@ class Dictionary:
             heard = str(c.get("heard", "")).strip()
             word = str(c.get("word", "")).strip()
             if heard and word and _fold(heard) != _fold(word):
-                self.corrections[_fold(heard)] = {
+                corrections[_fold(heard)] = {
                     "heard": heard,
                     "word": word,
                     "count": int(c.get("count", 1)),
                     "contexts": [str(x) for x in c.get("contexts", []) if x],
                 }
+        return entries, corrections
+
+    @property
+    def read_only(self):
+        """True when the file could not be read at startup: changes are kept
+        for this session only, so the file is never overwritten."""
+        return self._read_failed
 
     def save(self):
-        with self.lock:
-            words = sorted(self.entries.values(), key=lambda e: _fold(e["word"]))
-            corrections = sorted(self.corrections.values(), key=lambda c: _fold(c["heard"]))
-        tmp = self.path + ".tmp"
-        try:
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump({"words": words, "corrections": corrections}, f, indent=2, ensure_ascii=False)
-            os.replace(tmp, self.path)
-        except Exception:
-            pass
+        with self._save_lock:
+            with self.lock:
+                words = sorted((dict(e) for e in self.entries.values()), key=lambda e: _fold(e["word"]))
+                corrections = sorted((dict(c, contexts=list(c["contexts"])) for c in self.corrections.values()),
+                                     key=lambda c: _fold(c["heard"]))
+            if self._read_failed:
+                return
+            tmp = self.path + ".tmp"
+            try:
+                with open(tmp, "w", encoding="utf-8") as f:
+                    json.dump({"words": words, "corrections": corrections}, f, indent=2, ensure_ascii=False)
+                # On Windows the replace fails while anything else has the
+                # file open (a reader, antivirus): retry briefly, never drop
+                # the save silently.
+                for attempt in range(10):
+                    try:
+                        os.replace(tmp, self.path)
+                        return
+                    except PermissionError:
+                        if attempt == 9:
+                            raise
+                        time.sleep(0.05)
+            except Exception as e:
+                print(f"[Dictionary Warning] Could not save {DICTIONARY_FILE} ({e}).", flush=True)
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
 
     # ---- editing -----------------------------------------------------------
 
@@ -393,15 +484,45 @@ class Dictionary:
             return None
         return ", ".join(words) + "."
 
+    def correction_pairs(self):
+        """(heard, word) for every learned mishearing: the LLM may make these
+        replacements (see speak_text.cleanup_is_faithful)."""
+        with self.lock:
+            return [(c["heard"], c["word"]) for c in self.corrections.values()]
+
+    @staticmethod
+    def casing_is_enforced(word):
+        """True when apply_casing() fixes this entry's spelling by itself:
+        multi-word entries and words with a capital after the first letter
+        ('SAP', 'iPhone', 'Business Central', 'machine learning'). Single
+        words with at most a first capital ('Mette', 'webshop') are left to
+        the LLM hint: forcing them would also change the ordinary word."""
+        return " " in word or word[1:] != word[1:].lower()
+
+    @staticmethod
+    def _expected_form(word, found, text, pos):
+        """The spelling the occurrence `found` at text[pos] should have. An
+        all-lowercase entry ('excel', 'machine learning') says which word it
+        is, not that a capital at the start of a sentence is wrong: there it
+        keeps the found first letter ('Machine Learning' -> 'Machine learning')."""
+        if word == word.lower() and _at_sentence_start(text, pos):
+            return found[0] + word[1:]
+        return word
+
     def prepare(self, raw_text, lang):
         """
-        Run before the LLM. Returns (text, hint, applied):
-        - text   : raw transcript with confirmed mishearings already replaced
-        - hint   : one line for the cleanup prompt, or "" when nothing is relevant
-        - applied: list of (heard, word) replaced deterministically
+        Run before the LLM. Returns (text, hint, applied, needs_llm):
+        - text     : raw transcript with confirmed mishearings already replaced
+        - hint     : one line for the cleanup prompt, or "" when nothing is relevant
+        - applied  : list of (heard, word) replaced deterministically
+        - needs_llm: True when the hint asks for something only the LLM can do
+                     (an unconfirmed mishearing, or a name whose capital
+                     apply_casing does not enforce). A word that is already
+                     spelled right, or that apply_casing fixes, does not stop
+                     a short phrase from skipping the LLM.
         """
         if not raw_text:
-            return raw_text, "", []
+            return raw_text, "", [], False
         with self.lock:
             corrections = list(self.corrections.values())
             entries = list(self.entries.values())
@@ -435,19 +556,40 @@ class Dictionary:
             else:
                 pending.append((c["heard"], c["word"]))
 
-        # Dictionary words present in the text: exact form -> "keep", other casing -> "is spelled"
+        # Dictionary words present in the text: exact form -> "keep", other
+        # casing -> "is spelled". Every occurrence counts ("Jira and jira"),
+        # and the longest entry wins a span: 'Mette' is not a separate match
+        # inside 'mette-kristine' when 'Mette-Kristine' is an entry too.
         keep, respell = [], []
-        for e in entries:
-            m = _word_pattern(e["word"]).search(text)
-            if not m:
-                continue
-            if m.group(0) == e["word"]:
-                keep.append(e["word"])
-            else:
-                respell.append((m.group(0), e["word"]))
+        needs_llm = bool(pending)
+        claimed = set()   # character offsets inside a longer entry's match
+        for e in sorted(entries, key=lambda e: -len(e["word"])):
+            word = e["word"]
+            wrong, right = None, []
+            for m in _word_pattern(word).finditer(text):
+                if m.start() in claimed and m.end() - 1 in claimed:
+                    continue
+                claimed.update(range(m.start(), m.end()))
+                expected = self._expected_form(word, m.group(0), text, m.start())
+                if m.group(0) == expected:
+                    # The form found ('Excel' at a sentence start), not the
+                    # entry: "keep 'excel'" would invite Qwen to lowercase it.
+                    if expected not in right:
+                        right.append(expected)
+                elif wrong is None:
+                    wrong = (m.group(0), expected)
+            # With a respell for this entry, a sentence-start capital in the
+            # keep list would contradict it: keep only the entry's own form.
+            keep.extend(f for f in right if wrong is None or f == word)
+            if wrong is not None:
+                respell.append(wrong)
+                # A lowercase single word ('webshop') gets the hint when Qwen
+                # runs anyway, but is not worth waiting for Qwen.
+                if not self.casing_is_enforced(word) and word != word.lower():
+                    needs_llm = True
 
         hint = self._build_hint(lang, pending + respell, keep)
-        return text, hint, applied
+        return text, hint, applied, needs_llm
 
     @staticmethod
     def _build_hint(lang, pairs, keep):
@@ -474,7 +616,8 @@ class Dictionary:
 
         Single words whose only capital is the first letter ('Monday', 'Annika')
         are left to the LLM hint: forcing them would also capitalize the
-        ordinary word 'monday' mid-sentence.
+        ordinary word 'monday' mid-sentence. All-lowercase entries leave a
+        capital at the start of a sentence alone.
         """
         if not text or not self.entries:
             return text
@@ -483,7 +626,8 @@ class Dictionary:
         for w in words:
             if not w:
                 continue
-            if " " not in w and w[1:] == w[1:].lower():
+            if not self.casing_is_enforced(w):
                 continue
-            text = _word_pattern(w).sub(w, text)
+            text = _word_pattern(w).sub(
+                lambda m, w=w: self._expected_form(w, m.group(0), m.string, m.start()), text)
         return text
