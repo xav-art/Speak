@@ -345,6 +345,32 @@ def apply_spoken_commands(text, lang=None):
     return re.sub(r"\n\n(?=- )", "\n", text)   # "new line, bullet point": no empty line
 
 
+# Punctuation commands refer to what came before too. A false alarm costs one
+# more cleanup of the two pieces after the stop, so the short words that
+# start ordinary sentences as well ("No problem", "Wait for me", "Point
+# taken") count only when Whisper wrote a pause after them ("No, Wednesday").
+_CONTINUING = tuple(sorted({*NEWLINE_COMMANDS, *PARAGRAPH_COMMANDS, *BULLET_COMMANDS, *SCRATCH_COMMANDS,
+                            *CORRECTION_CUES, "punkt", "puce", "full stop", "question mark", "punktum", "komma",
+                            "spørgsmålstegn", "virgule"}, key=len, reverse=True))
+_CONTINUING_WITH_PAUSE = re.compile(r"^(?:no|wait|actually|period|comma|point|nej|vent|nein|warte|non|attends)[,.;:!?]",
+                                    re.IGNORECASE)
+
+
+def continues_previous(previous, text, lang=None):
+    """Whether `text`, the next piece of a dictation cut at a pause, must be
+    cleaned together with `previous`: the previous piece did not end its
+    sentence, or this one starts with a command or a correction that refers
+    to what came before ("No wait, Wednesday", "Scratch that", "New line")."""
+    end = previous.rstrip() if previous else ""
+    if end and (end[-1] not in ".!?" or end.endswith("...")):   # "...": trailing off mid-sentence
+        return True
+    start = strip_leading_fillers(text, lang).lstrip(" \"'“„«(")
+    if _CONTINUING_WITH_PAUSE.match(start):
+        return True
+    words = " ".join(words_of(start))
+    return any(words == cue or words.startswith(cue + " ") for cue in _CONTINUING)
+
+
 def remove_fillers(text, lang=None):
     """Filler sounds anywhere, with the commas around them: "Can you, uh,
     check it" -> "Can you check it". The punctuation is left to the LLM."""

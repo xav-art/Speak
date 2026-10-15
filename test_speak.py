@@ -2240,5 +2240,345 @@ class TestMeetingReviewRound4(unittest.TestCase):
         self.assertEqual(writer.frames, 1600)
 
 
+class TestFindPieceEnd(unittest.TestCase):
+    def test_waits_until_the_piece_is_long_enough(self):
+        self.assertIsNone(speak_engines.find_piece_end([(0.0, 10.0)], 0.0, 15.0))
+
+    def test_cuts_in_the_first_pause_after_twenty_seconds(self):
+        speech = [(0.2, 8.0), (8.3, 19.0), (19.8, 24.0), (25.2, 30.0)]
+        cut = speak_engines.find_piece_end(speech, 0.0, 30.0)
+        self.assertAlmostEqual(cut, 25.2 - 1.2 + 0.5)   # 0.5 s into the 1.2 s pause at 24.0
+        self.assertTrue(24.0 < cut < 25.2)              # inside the pause: no word is split
+        self.assertIsNone(speak_engines.find_piece_end(speech[:3], 0.0, 24.3))   # pause still too short
+
+    def test_a_short_pause_before_twenty_seconds_is_ignored(self):
+        speech = [(0.0, 10.0), (11.0, 23.0), (23.7, 29.0)]
+        self.assertAlmostEqual(speak_engines.find_piece_end(speech, 0.0, 26.0), 23.0 + 0.35)
+
+    def test_without_a_pause_it_cuts_in_the_last_breath_before_the_window_ends(self):
+        speech = [(0.0, 12.0), (12.3, 21.0), (21.2, 30.0)]   # breaths of 0.3 s and 0.2 s only
+        self.assertEqual(speak_engines.find_cut(speech, 0.0, 30.0), (21.1, False))   # not a pause: may split a sentence
+        self.assertIsNone(speak_engines.find_piece_end(speech, 0.0, 27.0))   # still time for a real pause
+        self.assertEqual(speak_engines.find_piece_end([(0.0, 40.0)], 0.0, 40.0), 28.0)   # no gap at all
+
+    def test_pieces_after_the_first(self):
+        speech = [(30.0, 52.0), (52.8, 60.0)]
+        self.assertAlmostEqual(speak_engines.find_piece_end(speech, 30.0, 60.0), 52.4)
+
+    def test_trailing_silence_counts_as_a_pause(self):
+        self.assertAlmostEqual(speak_engines.find_piece_end([(0.0, 21.0)], 0.0, 22.0), 21.5)
+
+
+class TestCombinePieces(unittest.TestCase):
+    def test_texts_joined_and_the_main_language(self):
+        pieces = [{"text": "Hej Anna.", "lang": "da", "prob": 0.9, "seconds": 22},
+                  {"text": "", "lang": "en", "prob": 0.4, "seconds": 3},
+                  {"text": "Short English bit.", "lang": "en", "prob": 0.7, "seconds": 5}]
+        self.assertEqual(speak_engines.combine_pieces(pieces), ("Hej Anna. Short English bit.", "da", 0.9))
+        self.assertEqual(speak_engines.combine_pieces([{"text": "", "lang": "de", "prob": 0.5, "seconds": 2}]),
+                         ("", "de", 0.5))
+
+
+class TestLiveTranscriber(unittest.TestCase):
+    def _app(self, fail_after=None, texts=None):
+        import threading
+        from types import SimpleNamespace
+        calls, cleaned = [], []
+
+        def transcribe(audio, prefer=None, context="", language=None):
+            calls.append({"seconds": len(audio) / 16000, "language": language, "context": context})
+            if fail_after is not None and len(calls) > fail_after:
+                raise RuntimeError("whisper broke")
+            text = texts[len(calls) - 1] if texts else f"piece{len(calls)}."
+            return text, "da", 0.8
+
+        def clean_text(text, lang, verbose=True):
+            cleaned.append(text)
+            return f"<{text}>"
+        app = SimpleNamespace(engine_lock=threading.RLock(), transcribe=transcribe, clean_text=clean_text)
+        return app, calls, cleaned
+
+    def setUp(self):
+        # Speech everywhere except a 1 s pause every 12 s (11 s into each
+        # 12 s of the window the VAD is given).
+        self._vad = speak_engines._speech_timestamps
+        speak_engines._speech_timestamps = lambda audio: [
+            {"start": int(s * 16000), "end": int(min(s + 11.0, len(audio) / 16000) * 16000)}
+            for s in np.arange(0.0, len(audio) / 16000, 12.0)]
+        self.addCleanup(setattr, speak_engines, "_speech_timestamps", self._vad)
+
+    def _run(self, live, seconds):
+        audio = np.zeros(seconds * 16000, np.float32)
+        for s in range(1, seconds + 1):        # the recording grows, polled once a second
+            live.step(audio[:s * 16000])
+        return audio
+
+    def test_a_long_dictation_is_transcribed_and_cleaned_in_pieces(self):
+        app, calls, cleaned = self._app()
+        live = speak_engines.LiveTranscriber(app, [], 16000)
+        audio = self._run(live, 65)
+        # Each piece ends in the first pause after 20 s, 23 s into it (the
+        # second as soon as 0.5 s of that pause has been recorded).
+        self.assertEqual([round(c["seconds"], 2) for c in calls], [23.5, 23.25])
+        self.assertEqual(cleaned, ["piece1.", "piece2."])          # cleaned while recording
+        text, lang, prob, clean = live.finish(audio)
+        self.assertEqual(text, "piece1. piece2. piece3.")
+        self.assertEqual(clean, "<piece1.> <piece2.> <piece3.>")
+        self.assertEqual(cleaned, ["piece1.", "piece2.", "piece3."])   # only the rest after the stop
+        self.assertEqual(lang, "da")
+        self.assertEqual(round(calls[-1]["seconds"], 2), 18.25)
+        self.assertEqual(calls[0]["language"], None)              # the first piece detects the language
+        self.assertEqual(calls[1]["language"], "da")              # the others keep it, as a single pass does
+        self.assertEqual(calls[2]["context"], "piece1. piece2.")  # and its text
+
+    def test_a_correction_after_a_cut_is_cleaned_with_the_piece_before(self):
+        app, _, cleaned = self._app(texts=["We meet on Tuesday.", "No wait, on Wednesday at ten.", "See you then."])
+        live = speak_engines.LiveTranscriber(app, [], 16000)
+        _, _, _, clean = live.finish(self._run(live, 65))
+        self.assertEqual(clean, "<We meet on Tuesday. No wait, on Wednesday at ten.> <See you then.>")
+
+    def test_a_sentence_cut_without_a_pause_is_cleaned_whole(self):
+        app, _, cleaned = self._app(texts=["We need to finalize the", "campaign before Friday.", "Thanks."])
+        live = speak_engines.LiveTranscriber(app, [], 16000)
+        _, _, _, clean = live.finish(self._run(live, 65))
+        self.assertEqual(clean, "<We need to finalize the campaign before Friday.> <Thanks.>")
+
+    def test_a_short_dictation_is_one_pass_as_before(self):
+        app, calls, cleaned = self._app()
+        live = speak_engines.LiveTranscriber(app, [], 16000)
+        audio = self._run(live, 15)
+        self.assertEqual(calls, [])
+        self.assertEqual(live.finish(audio), ("piece1.", "da", 0.8, None))   # the worker cleans it as usual
+        self.assertEqual(calls, [{"seconds": 15.0, "language": None, "context": ""}])
+        self.assertEqual(cleaned, [])
+
+    def test_the_thread_reads_the_recorders_frames(self):
+        import time as _time
+        app, calls, _ = self._app()
+        frames = []
+        live = speak_engines.LiveTranscriber(app, frames, 16000)
+        live.POLL_SECONDS = 0.02
+        live.start()
+        for _ in range(35):
+            frames.append(np.zeros((16000, 1), np.float32))   # one second per block, as the callback appends
+            _time.sleep(0.01)
+        deadline = _time.monotonic() + 3
+        while not calls and _time.monotonic() < deadline:
+            _time.sleep(0.02)
+        text, _, _, clean = live.finish(np.concatenate(frames).reshape(-1))
+        self.assertEqual(text, "piece1. piece2.")
+        self.assertEqual(clean, "<piece1.> <piece2.>")
+        self.assertFalse(live.thread.is_alive())
+
+    def test_a_cut_without_a_pause_joins_the_pieces(self):
+        # Pauses every 10 s: the one after 20 s (at 29 s) is past the 28 s
+        # window, so each cut is a fallback in a breath, mid-sentence perhaps.
+        speak_engines._speech_timestamps = lambda audio: [
+            {"start": int(s * 16000), "end": int(min(s + 9.0, len(audio) / 16000) * 16000)}
+            for s in np.arange(0.0, len(audio) / 16000, 10.0)]
+        app, calls, cleaned = self._app()
+        live = speak_engines.LiveTranscriber(app, [], 16000)
+        _, _, _, clean = live.finish(self._run(live, 65))
+        self.assertEqual(clean, "<piece1. piece2. piece3.>")   # cleaned as one, like a single pass
+
+    def test_a_failing_piece_falls_back_to_one_pass(self):
+        app, calls, _ = self._app(fail_after=0)
+        live = speak_engines.LiveTranscriber(app, [], 16000)
+        live.POLL_SECONDS = 0.01
+        audio = np.zeros(40 * 16000, np.float32)
+        live.frames.append(audio.reshape(-1, 1))
+        live.start()
+        live.thread.join(2)
+        self.assertTrue(live.failed)
+        with self.assertRaises(RuntimeError):   # the fallback pass is a normal transcribe call
+            live.finish(audio)
+        self.assertEqual(round(calls[-1]["seconds"]), 40)
+
+
+class TestContinuesPrevious(unittest.TestCase):
+    def test_commands_corrections_and_open_sentences(self):
+        for previous, text in (("We meet on Tuesday.", "No wait, Wednesday."), ("Fine.", "Scratch that."),
+                               ("Hi Anna,", "thanks."), ("Okay.", "New line, thanks."), ("Here.", "Bullet point milk."),
+                               ("Vi ses tirsdag.", "Nej vent, onsdag."), ("Ten.", "Um, sorry, twelve.")):
+            self.assertTrue(st.continues_previous(previous, text), (previous, text))
+        for previous, text in (("We meet on Tuesday.", "The photos are ready."), ("Fine.", "Sorry is a word."[6:]),
+                               ("Ja.", "Nyheden kommer fredag."), ("Bring milk.", "And bread."),
+                               ("Fine.", "No problem at all."), ("Ok.", "Point taken."), ("Ja.", "Vent lidt."),
+                               ("Gut.", "Warte mal."), ("Done.", "Actually it was fine.")):
+            self.assertFalse(st.continues_previous(previous, text), (previous, text))
+
+
+class TestWorkerWithLivePieces(unittest.TestCase):
+    def _app(self, finish):
+        import queue
+        import threading
+        from types import SimpleNamespace
+        app = speak.SpeakApp.__new__(speak.SpeakApp)
+        app.engine_lock, app.clipboard_lock = threading.RLock(), threading.Lock()
+        app.config, app.jobs = {"last_language": "da"}, queue.Queue()
+        app.learn_hotkey_req = "CTRL+ALT+L"
+        app.ai_mode, app.local_llm = "local", object()
+        app.dictionary = SimpleNamespace(note_usage=lambda text: None)
+        app.inserted, app.seen_lock = [], []
+        app.transcribe = lambda audio: self.fail("the whole recording must not be transcribed again")
+        app.clean_text = lambda text, lang: text.upper()
+        app.insert_text = lambda text: app.inserted.append(text)
+        app._schedule_clipboard_restore = lambda token: None
+        app.play_sound = lambda kind: None
+
+        class Live:
+            pieces, during, stt_seconds = [1, 2], 2, 0.1
+
+            def finish(self, audio):
+                app.seen_lock.append(app.engine_lock._is_owned())
+                return finish
+        return app, Live()
+
+    def test_the_worker_uses_the_text_cleaned_while_recording(self):
+        app, live = self._app(("hej anna. vi ses.", "da", 0.9, "Hej Anna. Vi ses."))
+        app._process_worker((np.zeros(16000, np.float32), live))
+        self.assertEqual(app.inserted, ["Hej Anna. Vi ses."])
+        self.assertEqual(app.seen_lock, [False])   # no lock held while waiting for the live pieces
+
+    def test_an_uncut_dictation_is_cleaned_as_usual(self):
+        app, live = self._app(("hej anna.", "da", 0.9, None))
+        app._process_worker((np.zeros(16000, np.float32), live))
+        self.assertEqual(app.inserted, ["HEJ ANNA."])
+
+
+class TestLongAudioKeepsTimestamps(unittest.TestCase):
+    def test_whisper_always_keeps_timestamps(self):
+        from types import SimpleNamespace
+        calls = []
+
+        class Whisper:
+            def transcribe(self, audio, **kwargs):
+                calls.append(kwargs["without_timestamps"])
+                info = SimpleNamespace(language="en", language_probability=0.9, duration_after_vad=1.0)
+                return iter([]), info
+        app = speak.SpeakApp.__new__(speak.SpeakApp)
+        app.whisper_model = Whisper()
+        app.dictionary = SimpleNamespace(whisper_prompt=lambda: None)
+        app._decode(np.zeros(20 * 16000, np.float32), "en")   # 10 of 54 words came out without them
+        app._decode(np.zeros(69 * 16000, np.float32), "en")   # 17 of 115
+        self.assertEqual(calls, [False, False])
+
+
+class TestPhase4ReviewCases(unittest.TestCase):
+    """Inputs from the adversarial review of Phase 4."""
+
+    def _whisper_app(self, words=None, tokens_per_word=1):
+        from types import SimpleNamespace
+        calls = []
+
+        class Tokenizer:
+            def encode(self, text, add_special_tokens=False):
+                return SimpleNamespace(ids=[0] * (len(text.split()) * tokens_per_word))
+
+        class Whisper:
+            hf_tokenizer = Tokenizer()
+
+            def transcribe(self, audio, **kwargs):
+                calls.append(kwargs)
+                info = SimpleNamespace(language=kwargs.get("language") or "en", language_probability=0.9,
+                                       duration_after_vad=10.0, all_language_probs=[])
+                return iter([]), info
+        app = speak.SpeakApp.__new__(speak.SpeakApp)
+        app.whisper_model, app.language, app.config, app.model_size = Whisper(), None, {}, "base"
+        prompt = ", ".join(words) + "." if words else None
+        app.dictionary = SimpleNamespace(whisper_prompt=lambda: prompt)
+        return app, calls
+
+    def test_later_pieces_keep_the_first_pieces_language(self):
+        app, calls = self._whisper_app()
+        app.transcribe(np.zeros(16000, np.float32), language="da")
+        self.assertEqual(calls[0]["language"], "da")
+        app.language = "de"   # a language the user locked wins
+        app.transcribe(np.zeros(16000, np.float32), language="da")
+        self.assertEqual(calls[1]["language"], "de")
+
+    def test_the_prompt_keeps_the_most_used_dictionary_words(self):
+        words = [f"Name{i}" for i in range(100)]   # most used first, 2 tokens each
+        app, calls = self._whisper_app(words, tokens_per_word=2)
+        prompt = app._whisper_prompt("we talked about the launch and the photos " * 20)
+        self.assertTrue(prompt.endswith("."))
+        kept = prompt.split("photos ")[-1] if "photos " in prompt else prompt
+        self.assertTrue(kept.startswith("Name0, Name1"), prompt[-200:])   # dropped from the end: least used
+        self.assertNotIn("Name99", prompt)
+        self.assertLessEqual(len(prompt.split()) * 2, app.PROMPT_TOKENS + 2)
+        self.assertLess(prompt.index("photos"), prompt.index("Name0"))       # context first, the words last
+        self.assertEqual(self._whisper_app(["SAP"])[0]._whisper_prompt(""), "SAP.")
+
+    def test_a_short_rest_with_speech_is_not_dropped(self):
+        import threading
+        from types import SimpleNamespace
+        calls = []
+        app = SimpleNamespace(engine_lock=threading.RLock(),
+                              transcribe=lambda audio, **kw: calls.append(len(audio)) or ("Ja.", "da", 0.9),
+                              clean_text=lambda text, lang, verbose=True: text)
+        live = speak_engines.LiveTranscriber(app, [], 16000)
+        live.pieces, live.done = [{"text": "Hej.", "lang": "da", "prob": 0.9, "seconds": 28, "clean": "Hej.",
+                                   "at_pause": True}], 28 * 16000
+        vad = speak_engines._speech_timestamps
+        self.addCleanup(setattr, speak_engines, "_speech_timestamps", vad)
+        speak_engines._speech_timestamps = lambda audio: [{"start": 0, "end": len(audio)}]
+        text, _, _, _ = live.finish(np.zeros(int(28.25 * 16000), np.float32))
+        self.assertEqual(text, "Hej. Ja.")   # 0.25 s, but speech
+        speak_engines._speech_timestamps = lambda audio: []
+        live2 = speak_engines.LiveTranscriber(app, [], 16000)
+        live2.pieces, live2.done = list(live.pieces[:1]), 28 * 16000
+        self.assertEqual(live2.finish(np.zeros(int(28.25 * 16000), np.float32))[0], "Hej.")   # a click: dropped
+
+    def test_a_cleanup_failure_keeps_the_piece(self):
+        import threading
+        from types import SimpleNamespace
+
+        def clean_text(text, lang, verbose=True):
+            raise ValueError("dictionary broke")
+        app = SimpleNamespace(engine_lock=threading.RLock(), clean_text=clean_text,
+                              transcribe=lambda audio, **kw: ("Hej Anna.", "da", 0.9))
+        live = speak_engines.LiveTranscriber(app, [], 16000)
+        live._transcribe(np.zeros(16000, np.float32))
+        self.assertFalse(live.failed)
+        self.assertEqual(live.pieces[0]["text"], "Hej Anna.")
+        self.assertIsNone(live.pieces[0]["clean"])
+
+    def test_more_starts_that_continue_the_piece_before(self):
+        for previous, text in (("Thanks", "Full stop. New line, bye."), ("Tak", "Punktum. Tak."),
+                               ("We meet on Tuesday.", "No, Wednesday."), ("We need to finalize the...", "Campaign."),
+                               ("Ten.", "Wait, twelve."), ("Ok.", "Actually, make that eleven.")):
+            self.assertTrue(st.continues_previous(previous, text), (previous, text))
+
+
+class TestPhase4ReviewRound2(unittest.TestCase):
+    def test_a_pause_across_the_twenty_second_mark(self):
+        self.assertEqual(speak_engines.find_cut([(0.0, 19.8), (21.0, 25.0), (25.2, 30.0)], 0.0, 30.0), (20.3, True))
+        self.assertEqual(speak_engines.find_cut([(0.0, 19.5), (20.5, 40.0)], 0.0, 40.0), (20.0, True))
+        self.assertEqual(speak_engines.find_cut([(0.0, 27.9), (29.0, 40.0)], 0.0, 40.0), (28.0, True))   # hard cut in a pause
+        self.assertEqual(speak_engines.find_cut([(0.0, 40.0)], 0.0, 40.0), (28.0, False))
+
+    def test_pieces_next_to_a_breath_cut_are_not_cleaned_while_recording(self):
+        import threading
+        from types import SimpleNamespace
+        cleaned = []
+        app = SimpleNamespace(engine_lock=threading.RLock(),
+                              transcribe=lambda audio, **kw: ("Text.", "en", 0.9),
+                              clean_text=lambda text, lang, verbose=True: cleaned.append(text) or text)
+        live = speak_engines.LiveTranscriber(app, [], 16000)
+        piece = np.zeros(16000, np.float32)
+        live._transcribe(piece, at_pause=True)     # pause at both ends: cleaned now
+        live._transcribe(piece, at_pause=False)    # ends in a breath: will be merged
+        live._transcribe(piece, at_pause=True)     # starts at that breath: will be merged
+        live._transcribe(piece, at_pause=True)     # pauses again: cleaned now
+        self.assertEqual([p["clean"] is not None for p in live.pieces], [True, False, False, True])
+        self.assertEqual(len(cleaned), 2)
+
+    def test_one_word_cues_need_a_pause_after_them(self):
+        self.assertTrue(st.continues_previous("We meet on Tuesday.", "No, Wednesday."))
+        self.assertTrue(st.continues_previous("Ok.", "Actually, make that eleven."))
+        self.assertFalse(st.continues_previous("Fine.", "No problem at all."))
+        self.assertFalse(st.continues_previous("Ok.", "Point taken."))
+
+
 if __name__ == "__main__":
     unittest.main()

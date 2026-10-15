@@ -3,6 +3,7 @@ models/
 
 # Personal, per-user data - never commit
 speak_dictionary.json
+speak_dictionary.json.bak-*
 speak_dictionary.json.tmp
 speak_config.json
 speak_config.json.tmp

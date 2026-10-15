@@ -57,7 +57,7 @@ import speak_engines
 import speak_insert
 from speak_base import ALLOWED_LANGUAGES, LOCAL_LLM_DIR, MODELS_DIR, _kernel32, _user32, log
 from speak_engines import (CLEANUP_EXAMPLES, CLEANUP_SYSTEM_PROMPT, LANGUAGE_NOTES, LOCAL_LLM_MODELS,
-                           MEETING_TURN_NOTE, WHISPER_MODELS, EnginesMixin, build_cleanup_prompt,
+                           MEETING_TURN_NOTE, WHISPER_MODELS, EnginesMixin, LiveTranscriber, build_cleanup_prompt,
                            download_file, download_models, ensure_local_llm, get_dir_size_str)
 from speak_insert import (EXTENDED_KEYS, INPUT, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY,
                           KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, PM_REMOVE, VK_C, VK_CONTROL, VK_INSERT, VK_LWIN,
@@ -114,6 +114,7 @@ def load_config(path=None):
         "llm_threads": 6,
         "speculative_decoding": False,
         "llm_fast_path": True,
+        "live_transcription": True,
         "language_check_short_phrases": True,
         "warm_up": True,
         "high_priority": True,
@@ -321,6 +322,7 @@ class SpeakApp(EnginesMixin, InsertionMixin):
             self.audio_frames = []
             self._auto_stop_requested = False
             self.is_recording = True
+            self.live = None
             try:
                 self.record_stream = sd.InputStream(
                     samplerate=self.sample_rate,
@@ -329,6 +331,10 @@ class SpeakApp(EnginesMixin, InsertionMixin):
                     callback=self.audio_callback
                 )
                 self.record_stream.start()
+                if self.config.get("live_transcription", True) and self.whisper_model is not None:
+                    # Long dictations: pieces are transcribed while the user speaks.
+                    self.live = LiveTranscriber(self, self.audio_frames, self.sample_rate)
+                    self.live.start()
             except Exception as e:
                 self.is_recording = False
                 log(f"[Audio Error] Could not open microphone: {e}")
@@ -351,10 +357,13 @@ class SpeakApp(EnginesMixin, InsertionMixin):
             except Exception:
                 pass
             captured = list(self.audio_frames)
+            live, self.live = self.live, None
 
         threading.Thread(target=self.play_sound, args=("stop",), daemon=True).start()
 
         if not captured:
+            if live:
+                live.stop_event.set()
             log("[Warning] No audio recorded.")
             return
 
@@ -362,6 +371,8 @@ class SpeakApp(EnginesMixin, InsertionMixin):
         duration = len(audio_data) / self.sample_rate
 
         if duration < 0.35:
+            if live:
+                live.stop_event.set()
             log(f"[Ignored] Audio too short ({duration:.2f}s).")
             return
 
@@ -370,17 +381,24 @@ class SpeakApp(EnginesMixin, InsertionMixin):
             log(f"[QUEUED] {duration:.1f}s of speech - will be inserted after the {pending} dictation(s) still processing.")
         else:
             log(f"[TRANSCRIBING] Processing {duration:.1f}s of speech using faster-whisper-{self.model_size}...")
-        self.jobs.put(audio_data)
+        self.jobs.put((audio_data, live))
 
-    def _process_worker(self, audio_data):
+    def _process_worker(self, job):
+        audio_data, live = job if isinstance(job, tuple) else (job, None)
         t0 = time.time()
         try:
+            # 1. Whisper. A long dictation was partly transcribed while it was
+            #    spoken: finish() does the rest (and takes engine_lock itself).
+            pieces = cleaned = stt = None
+            if live is not None:
+                raw_text, target_lang, lang_prob, cleaned = live.finish(audio_data)
+                pieces, stt = live.during, live.stt_seconds
             # Steps 1 and 2 use the shared engines. Insertion does not, so a
             # meeting being cleaned up does not wait for the paste.
             with self.engine_lock:
-                # 1. Local Whisper Speech-to-Text
-                raw_text, target_lang, lang_prob = self.transcribe(audio_data)
-                t_whisper = time.time() - t0
+                if live is None:
+                    raw_text, target_lang, lang_prob = self.transcribe(audio_data)
+                t_whisper = time.time() - t0 if stt is None else stt
 
                 if not raw_text:
                     log("[Info] No speech detected.")
@@ -392,10 +410,17 @@ class SpeakApp(EnginesMixin, InsertionMixin):
                     save_config(self.config)
 
                 lang_name = ALLOWED_LANGUAGES.get(target_lang, target_lang.upper())
-                log(f"[Whisper STT {t_whisper:.2f}s] [{lang_name} ({target_lang}) - {lang_prob*100:.0f}% confidence]: \"{raw_text}\"")
+                in_pieces = f", after {pieces} piece(s) done while you spoke" if pieces else ""
+                log(f"[Whisper STT {t_whisper:.2f}s{in_pieces}] [{lang_name} ({target_lang}) - {lang_prob*100:.0f}% confidence]: \"{raw_text}\"")
 
-                # 2. Dictionary + Local AI Formatting & Cleanup
-                final_text = self.clean_text(raw_text, target_lang)
+                # 2. Dictionary + Local AI Formatting & Cleanup (done piece by
+                #    piece while recording, for a long dictation)
+                if cleaned is not None:
+                    final_text = cleaned
+                    if self.ai_mode != "off" and self.local_llm:
+                        log(f"[AI Formatted, piece by piece]: \"{final_text}\"")
+                else:
+                    final_text = self.clean_text(raw_text, target_lang)
                 if not final_text:
                     log("[Info] Only filler words were heard. Nothing to insert.")
                     return

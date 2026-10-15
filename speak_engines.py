@@ -6,6 +6,7 @@ SpeakApp; every caller holds app.engine_lock (see CLAUDE.md).
 
 import os
 import sys
+import threading
 import time
 
 import numpy as np
@@ -373,17 +374,22 @@ class EnginesMixin:
             return True
         return setting in ("true", "1", "yes", "on") and self.model_size in self.LANGUAGE_CHECK_MODELS
 
-    def transcribe(self, audio_data):
+    def transcribe(self, audio_data, context="", language=None):
         """Whisper speech-to-text for one dictation. The caller holds engine_lock.
         Returns (text, language, language probability); text is "" when no
-        speech was found."""
+        speech was found. context: text said just before (the previous piece
+        of a long dictation), so Whisper continues it.
+        language: decode in this language unless the user locked another
+        (the later pieces of a long dictation keep the first one's)."""
         # language=None lets faster-whisper detect the language on the first
         # window; the detect_language patch restricts it to the 4 supported
         # languages and the encoder cache makes detection nearly free.
         target_lang = self.language if self.language in ALLOWED_LANGUAGES else None
+        if target_lang is None and language in ALLOWED_LANGUAGES:
+            target_lang = language
         last = self.config.get("last_language")
         last = last if last in ALLOWED_LANGUAGES else None
-        text, info, _ = self._decode(audio_data, target_lang)
+        text, info, _ = self._decode(audio_data, target_lang, context=context)
         lang = info.language if info.language in ALLOWED_LANGUAGES else "en"
         prob = info.language_probability if self.language is None else 1.0
 
@@ -394,8 +400,8 @@ class EnginesMixin:
             # for like. Whisper's temperature fallback would re-decode up to 5
             # times in the wrong language (seen: 0.5 s -> 3.5 s), and the
             # encoder output is cached, so these two passes are decoder only.
-            _, _, det_logprob = self._decode(audio_data, lang, fallback=False)
-            alt_text, _, alt_logprob = self._decode(audio_data, last, fallback=False)
+            _, _, det_logprob = self._decode(audio_data, lang, fallback=False, context=context)
+            alt_text, _, alt_logprob = self._decode(audio_data, last, fallback=False, context=context)
             if alt_text and alt_logprob > det_logprob + self.LANGUAGE_CHECK_MARGIN:
                 log(f"[Language] Short phrase: {ALLOWED_LANGUAGES[last]} fits better than "
                     f"{ALLOWED_LANGUAGES[lang]} (\"{text}\" -> \"{alt_text}\").")
@@ -403,10 +409,36 @@ class EnginesMixin:
                 prob = dict(getattr(info, "all_language_probs", None) or []).get(last, 0.0)
         return text, lang, prob
 
-    def _decode(self, audio_data, language, fallback=True):
+    PROMPT_TOKENS = 200   # Whisper keeps the last 223 prompt tokens and drops the rest
+
+    def _whisper_prompt(self, context=""):
+        """The dictionary words, after the context: Whisper drops a long
+        prompt from the front, and the words matter more. Trimmed to
+        PROMPT_TOKENS by the model's own tokenizer, least used words first
+        (whisper_prompt lists the most used first); Danish names take far more
+        tokens than their letters suggest."""
+        words = self.dictionary.whisper_prompt() or ""
+        context = context.strip()
+        tokenizer = getattr(self.whisper_model, "hf_tokenizer", None)
+        if tokenizer is not None:
+            try:
+                count = lambda text: len(tokenizer.encode(" " + text, add_special_tokens=False).ids) if text else 0
+                while context and count(context) > self.PROMPT_TOKENS // 3:
+                    context = context.split(" ", 1)[1] if " " in context else ""
+                budget = self.PROMPT_TOKENS - count(context)
+                items = words.rstrip(".").split(", ") if words else []
+                while items and count(", ".join(items) + ".") > budget:
+                    items.pop()
+                words = ", ".join(items) + "." if items else ""
+            except Exception:
+                pass
+        return " ".join(p for p in (context, words) if p) or None
+
+    def _decode(self, audio_data, language, fallback=True, context=""):
         """One Whisper pass. Returns (text, info, average token log-probability).
         fallback=False decodes greedily only (no temperature fallback)."""
         extra = {} if fallback else {"temperature": 0.0}
+        prompt = self._whisper_prompt(context)
         segments, info = self.whisper_model.transcribe(
             audio_data,
             beam_size=1,
@@ -414,12 +446,19 @@ class EnginesMixin:
             **extra,
             vad_filter=True,
             vad_parameters=dict(min_silence_duration_ms=400),
-            without_timestamps=True,
+            # (initial_prompt reaches only the first 30-second window: with
+            # condition_on_previous_text off, faster-whisper resets the prompt
+            # after each window. Live pieces are under 30 s, so all get it.)
+            # With timestamps. Without them Whisper often stops after the first
+            # sentence that ends in a pause and drops the rest: 10 of 54 words
+            # of a 21-second dictation (base and small), 17 of 115 of a
+            # 69-second one. The timestamps cost no measurable time.
+            without_timestamps=False,
             condition_on_previous_text=False,
             # initial_prompt biases decoding toward the dictionary spellings.
             # (hotwords= was tested too, but it makes Whisper stutter on
             # multi-word names: "Salesforce Force".)
-            initial_prompt=self.dictionary.whisper_prompt()
+            initial_prompt=prompt
         )
         kept, weighted, tokens = [], 0.0, 0
         for seg in segments:
@@ -587,3 +626,225 @@ class EnginesMixin:
         except Exception as e:
             log(f"[AI Warning] Local AI formatting failed ({e}). Using raw text.")
         return text
+
+
+# ---- Transcribing long dictations while they are spoken -----------------------
+#
+# Whisper encodes a fixed 30-second window per call, whatever the length of
+# the audio: on a laptop CPU the last 3 seconds of a 14-second dictation take
+# 80 to 90 % of the time of the whole. So transcribing short dictations in
+# pieces saves nothing. A long dictation needs one window per 30 seconds,
+# though: those pieces are transcribed while the user is still speaking,
+# and after the stop only the last piece is left.
+
+LIVE_PIECE_SECONDS = 20.0       # a piece ends at the first pause after this much audio
+LIVE_MAX_PIECE_SECONDS = 28.0   # and at the latest here, inside Whisper's 30-second window
+LIVE_MIN_PAUSE_SECONDS = 0.5
+
+
+def find_piece_end(speech, start, available, piece=LIVE_PIECE_SECONDS, max_piece=LIVE_MAX_PIECE_SECONDS,
+                   min_pause=LIVE_MIN_PAUSE_SECONDS):
+    """The cut of find_cut, without whether it is at a pause."""
+    cut = find_cut(speech, start, available, piece, max_piece, min_pause)
+    return cut[0] if cut else None
+
+
+def find_cut(speech, start, available, piece=LIVE_PIECE_SECONDS, max_piece=LIVE_MAX_PIECE_SECONDS,
+             min_pause=LIVE_MIN_PAUSE_SECONDS):
+    """Where the piece that starts at `start` should end (seconds), or None
+    to wait for more audio. `speech` is the VAD's [(start, end)] seconds of
+    the audio from `start` to `available` (the audio recorded so far).
+
+    The cut goes in the middle of the first pause of at least min_pause that
+    begins after `piece` seconds, so no word is split. Without one by
+    max_piece, it goes in the last breath (a gap of 0.15 s or more) in the
+    second half of the piece, or at max_piece as a last resort (Whisper would
+    cut there by itself). Returns (cut, at_pause): at_pause is False for the
+    fallbacks, where a sentence may go on across the cut."""
+    if available - start < piece:
+        return None
+    limit = start + max_piece
+    gaps, previous_end = [], start
+    for s, e in sorted(speech):
+        if s > previous_end:
+            gaps.append((previous_end, s))
+        previous_end = max(previous_end, e)
+    if available > previous_end:
+        gaps.append((previous_end, available))   # silence up to now
+    for g0, g1 in gaps:
+        # A pause counts once at least half of min_pause of it lies after the
+        # 20 s mark ("... ends at 19.8 s, silence to 21 s" cuts at 20.3 s).
+        if g1 - g0 >= min_pause and g1 - min_pause / 2 >= start + piece and g0 + min_pause / 2 <= limit:
+            cut = max(g0 + min(g1 - g0, 2 * min_pause) / 2, start + piece)
+            return min(cut, g1, limit), True
+    if available < limit:
+        return None   # no pause yet: wait, the speaker will breathe
+    # The latest breath in the second half: a piece of a few seconds would
+    # cost a whole Whisper window and a Qwen call for little text.
+    breaths = [(g0, min(g1, limit)) for g0, g1 in gaps
+               if start + piece / 2 <= g0 < limit and min(g1, limit) - g0 >= 0.15]
+    if breaths:
+        g0, g1 = breaths[-1]
+        return (g0 + g1) / 2, False
+    # The hard cut, at a pause after all if the limit falls into one.
+    return limit, any(g0 <= limit <= g1 and g1 - g0 >= min_pause for g0, g1 in gaps)
+
+
+def combine_pieces(pieces):
+    """(text, language, probability) of a dictation transcribed in pieces:
+    the texts joined, and the language of most of the speech."""
+    texts = [p["text"] for p in pieces if p["text"]]
+    if not texts:
+        return "", (pieces[0]["lang"] if pieces else "en"), (pieces[0]["prob"] if pieces else 0.0)
+    weight = {}
+    for p in pieces:
+        if p["text"]:
+            weight[p["lang"]] = weight.get(p["lang"], 0.0) + p["seconds"]
+    lang = max(weight, key=weight.get)
+    prob = next(p["prob"] for p in pieces if p["text"] and p["lang"] == lang)
+    return " ".join(texts), lang, prob
+
+
+class LiveTranscriber:
+    """Transcribes a long dictation in pieces while it is being recorded.
+
+    A thread polls the recorded frames; when a piece is complete (see
+    find_piece_end) it is transcribed under the app's engine_lock. finish()
+    is called by the dictation worker with the whole recording and returns
+    the pieces plus the rest. Dictations shorter than LIVE_PIECE_SECONDS are
+    never cut: finish() then transcribes everything in one pass, as before."""
+
+    POLL_SECONDS = 1.0   # the VAD reads up to 29 s of audio per poll
+
+    def __init__(self, app, frames, sample_rate=16000):
+        self.app, self.frames, self.sr = app, frames, sample_rate
+        self.audio = np.zeros(0, np.float32)
+        self._taken = 0          # frames copied into self.audio
+        self.done = 0            # samples already transcribed
+        self.pieces = []         # {"text", "lang", "prob", "seconds"}
+        self.stop_event = threading.Event()
+        self.thread = None
+        self.failed = False
+        self.stt_seconds = 0.0   # Whisper time after the stop, for the log
+        self.during = 0          # pieces done while the user was speaking
+
+    def start(self):
+        self.thread = threading.Thread(target=self._run, name="speak-live", daemon=True)
+        self.thread.start()
+
+    def _run(self):
+        while not self.stop_event.wait(self.POLL_SECONDS):
+            try:
+                self.step()
+            except Exception as e:
+                self.failed = True
+                log(f"[Live Warning] Transcribing while recording stopped ({e}); the dictation is transcribed "
+                    f"after the stop instead.")
+                return
+
+    def _collect(self):
+        n = len(self.frames)   # the audio callback only appends
+        if n > self._taken:
+            new = np.concatenate(self.frames[self._taken:n], axis=0).reshape(-1)
+            self.audio = np.concatenate([self.audio, new])
+            self._taken = n
+
+    def step(self, audio=None):
+        """Transcribes every piece that is complete. `audio` (the recording so
+        far) is for the benchmark; the thread reads the recorder's frames."""
+        live = audio is None
+        if live:
+            self._collect()
+            audio = self.audio
+        while not (live and self.stop_event.is_set()):
+            start, available = self.done / self.sr, len(audio) / self.sr
+            if available - start < LIVE_PIECE_SECONDS:
+                return
+            window = audio[self.done:int((start + LIVE_MAX_PIECE_SECONDS + 1) * self.sr)]
+            speech = [(start + s["start"] / self.sr, start + s["end"] / self.sr) for s in _speech_timestamps(window)]
+            found = find_cut(speech, start, start + len(window) / self.sr)
+            if found is None:
+                return
+            cut, at_pause = found
+            end = int(cut * self.sr)
+            self._transcribe(audio[self.done:end], at_pause=at_pause)
+            self.done = end
+            self.during += 1
+
+    def _transcribe(self, piece, clean=True, at_pause=True):
+        first = next((p for p in self.pieces if p["text"]), None)
+        with self.app.engine_lock:
+            # The first piece's language for the rest, as a single pass detects
+            # one language for the whole dictation: on its own, a short last
+            # piece ("Tak, hej") can be heard as another language and translated.
+            text, lang, prob = self.app.transcribe(
+                piece, language=first["lang"] if first else None,
+                context=" ".join(p["text"] for p in self.pieces)[-200:])
+            # The AI cleanup too, while the user is still speaking. finish()
+            # cleans again across the pieces that turn out to belong together.
+            cleaned = None
+            # The previous piece with text, as _clean_groups sees it.
+            previous = next((p for p in reversed(self.pieces) if p["text"]), None)
+            ends_at_pauses = at_pause and (previous is None or previous.get("at_pause", True))
+            if clean and text and ends_at_pauses:
+                try:
+                    cleaned = self.app.clean_text(text, lang, verbose=False)
+                except Exception as e:
+                    log(f"[Live Warning] Cleanup of a piece failed ({e}); it is cleaned after the stop.")
+        self.pieces.append({"text": text, "lang": lang, "prob": prob, "seconds": len(piece) / self.sr,
+                            "clean": cleaned, "at_pause": at_pause})
+
+    def finish(self, audio):
+        """The dictation's (text, language, probability, cleaned text), from
+        the pieces done while recording and the rest of `audio`. cleaned is
+        None when the dictation was not cut: the caller then cleans the text
+        as usual. Takes engine_lock itself, so the caller must not hold it
+        (a piece in progress needs it)."""
+        self.stop_event.set()
+        if self.thread is not None:
+            self.thread.join()
+        t0 = time.time()
+        if self.failed or not self.pieces:
+            with self.app.engine_lock:
+                result = self.app.transcribe(audio)
+            self.stt_seconds = time.time() - t0
+            return (*result, None)
+        rest = audio[self.done:]
+        # A fraction of a second after the last cut is transcribed only if it
+        # holds speech: Whisper invents words on a bare click.
+        if len(rest) >= int(0.3 * self.sr) or (len(rest) and _speech_timestamps(rest)):
+            self._transcribe(rest, clean=False)
+        self.stt_seconds = time.time() - t0
+        text, lang, prob = combine_pieces(self.pieces)
+        return text, lang, prob, self._clean_groups()
+
+    def _clean_groups(self):
+        """The cleaned text: pieces that belong together (see
+        speak_text.continues_previous) are cleaned as one, so a correction or
+        command right after a cut works as in a single pass."""
+        groups = []
+        for p in self.pieces:
+            if not p["text"]:
+                continue
+            previous = groups[-1][-1] if groups else None
+            # A cut that was not at a pause may split a sentence, though
+            # Whisper ends the first half with a full stop all the same.
+            if previous and (not previous.get("at_pause", True)
+                             or speak_text.continues_previous(previous["text"], p["text"], p["lang"])):
+                groups[-1].append(p)
+            else:
+                groups.append([p])
+        out = []
+        for group in groups:
+            if len(group) == 1 and group[0]["clean"] is not None:
+                out.append(group[0]["clean"])
+                continue
+            text, lang, _ = combine_pieces(group)
+            with self.app.engine_lock:
+                out.append(self.app.clean_text(text, lang, verbose=False))
+        return " ".join(o for o in out if o)
+
+
+def _speech_timestamps(audio):
+    from faster_whisper.vad import VadOptions, get_speech_timestamps
+    return get_speech_timestamps(audio, VadOptions(min_silence_duration_ms=300, speech_pad_ms=100))

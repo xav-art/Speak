@@ -222,6 +222,7 @@ Settings are saved to `speak_config.json` when you change them in the app. You c
 | `paste_mode` | `auto` | `auto`, `typing` or `clipboard` |
 | `whisper_threads` | `4` | CPU threads for Whisper |
 | `llm_threads` | `6` | CPU threads for Qwen |
+| `live_transcription` | `true` | Long dictations (over about 20 seconds) are transcribed in pieces while you speak, so after you stop only the last piece is left. Shorter ones are not affected |
 | `llm_fast_path` | `true` | Skip the AI step for short, clean phrases. A filler at the start (*um*, *øh*) does not stop a phrase from counting as clean: Speak removes it itself (in German, *um* is a word and stays) |
 | `warm_up` | `true` | Warm up both models at startup so the first dictation is fast |
 | `high_priority` | `true` | Run at above-normal priority so busy apps do not slow processing down |
@@ -245,6 +246,8 @@ Measured on an Intel Core Ultra 7 265U with `faster-whisper-base` and Qwen 2.5 1
 
 | Optimization | Effect |
 | :--- | :--- |
+| Whisper keeps its timestamps | Without them Whisper often stopped after the first sentence that ended in a pause: of a 69-second dictation only 17 of 115 words came out, of a 21-second one 10 of 54. With them every word comes out, at the same speed |
+| Long dictations transcribed and cleaned while you speak | Whisper works on a fixed 30-second window, so a short dictation cannot be sped up this way (its last 3 seconds take 80 to 90% of the whole). A dictation longer than about 20 seconds is cut at a pause (or, if you do not pause, at a breath) and each piece is transcribed and cleaned while you go on speaking; after you stop, only the last piece is left. Pieces cut at a breath, or that start with a command or a correction (*"no wait"*, *"scratch that"*, *"new line"*), are cleaned together, so the result is the same as in one go |
 | One encoder pass for language detection and transcription | Whisper stage **40 to 60% faster** (faster-whisper otherwise encodes the same 30 s window twice) |
 | Fast path for short, clean phrases (8 words or fewer, no fillers, commands or numbers). A filler at the start is removed by Speak itself, and filler lists are per language ("er" is a filler in English, "is" in Danish) | Language model skipped. In the benchmark, all short phrases now skip it (was about half), and they are inserted about 40% faster |
 | Clipboard restored on a timer after a paste | The next dictation no longer waits 0.8 s after every paste |
@@ -303,6 +306,15 @@ Speak/
 ```
 
 It reports the word error rate (WER) per language and clip type, how often the language was detected correctly, how often the AI step was skipped, the time per stage, and any text invented on the no-speech clips. Whisper and Qwen use fixed random seeds, so most clips give the same text every run. A few hard clips do not: when Whisper is unsure it re-decodes with random sampling, which the seed does not fully control. Expect the overall WER to move by about 1.5 points between identical runs, and look at which clips changed (`--compare`) before trusting a small difference. Timings depend on what else the computer is doing: compare runs made one after the other. To rebuild the clips, see `bench\make_clips.py`.
+
+Two more benchmarks use the same clips:
+
+```powershell
+.venv\Scripts\python -X utf8 bench\run_cleanup_bench.py                      # the AI cleanup alone, on fixed transcripts (2 minutes)
+.venv\Scripts\python -X utf8 bench\run_live_bench.py --model medium --live on en da   # long dictations, in real time
+```
+
+`run_cleanup_bench.py` scores the cleanup step (commands, corrections, fillers, meeting turns) without audio, for tuning the prompt. `run_live_bench.py` plays each language's clips one after the other into Speak through a simulated microphone, in real time, and reports the time from the stop to the text: compare `--live on` with `--live off`.
 
 ## Privacy
 
