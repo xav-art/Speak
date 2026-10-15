@@ -2580,5 +2580,258 @@ class TestPhase4ReviewRound2(unittest.TestCase):
         self.assertFalse(st.continues_previous("Ok.", "Point taken."))
 
 
+class TestTrayPieces(unittest.TestCase):
+    def test_dot_icon_pixels(self):
+        import speak_tray
+        px = speak_tray.dot_pixels(16, (40, 40, 220, 255))
+        self.assertEqual(px.shape, (16, 16, 4))
+        self.assertEqual(tuple(px[8, 8]), (40, 40, 220, 255))   # the centre: opaque, the colour unscaled
+        self.assertEqual(px[0, 0, 3], 0)                         # a corner: transparent
+        self.assertTrue(0 < px[8, 1, 3] < 255)                   # the edge: anti-aliased
+
+    def test_menu_follows_what_speak_is_doing(self):
+        import speak_tray
+        state = {"recording": False, "meeting": True}
+        tray = speak_tray.TrayIcon({"status": lambda: (state["recording"], state["meeting"])})
+        labels = [item[1] for item in tray.menu_items() if item]
+        self.assertEqual(labels, ["Start dictation", "Stop meeting recording", "Show Speak window", "Quit Speak"])
+        state.update(recording=True, meeting=False)
+        self.assertEqual(tray.menu_items()[0][1], "Stop dictation")
+        self.assertIsNone(tray.menu_items()[2])   # the separator
+
+    def test_set_state_without_an_icon_is_harmless(self):
+        import speak_tray
+        tray = speak_tray.TrayIcon({})
+        tray.set_state("recording")   # no window: nothing to update, no error
+        tray.set_state("no such state")
+        self.assertEqual(tray.state, "recording")
+
+
+class TestRefreshTray(unittest.TestCase):
+    def test_states(self):
+        import queue
+        from types import SimpleNamespace
+        app = speak.SpeakApp.__new__(speak.SpeakApp)
+        shown = []
+        app.tray = SimpleNamespace(set_state=shown.append)
+        app.is_recording, app.jobs = False, queue.Queue()
+        app.meetings = SimpleNamespace(is_recording=False, jobs=queue.Queue())
+        app.refresh_tray()
+        app.is_recording = True
+        app.refresh_tray()
+        app.is_recording, app.meetings.is_recording = False, True
+        app.refresh_tray()
+        app.meetings.is_recording = False
+        app.jobs.put("job")
+        app.refresh_tray()
+        self.assertEqual(shown, ["idle", "recording", "meeting", "working"])
+        app.tray = None
+        app.refresh_tray()   # no tray: nothing to do
+
+
+class TestSilenceWatcher(unittest.TestCase):
+    def setUp(self):
+        self.speech = set()   # seconds (from the start) that hold speech
+        self.position = 0.0
+        self._vad = speak_engines._speech_timestamps
+        self.addCleanup(setattr, speak_engines, "_speech_timestamps", self._vad)
+
+        def vad(audio):
+            # The window ends at self.position; it holds speech if any second in it does.
+            start = self.position - len(audio) / 16000
+            return [{"start": 0, "end": 1}] if any(start <= s < self.position for s in self.speech) else []
+        speak_engines._speech_timestamps = vad
+
+    def _feed(self, watcher, seconds):
+        stopped_at = None
+        for _ in range(int(seconds * 4)):
+            self.position += 0.25
+            if watcher.check(np.zeros(4000, np.float32)) and stopped_at is None:
+                stopped_at = self.position
+        return stopped_at
+
+    def test_stops_after_silence_once_speech_was_heard(self):
+        watcher = speak_engines.SilenceWatcher([], 3, lambda w: True)
+        self.speech = {1.0, 2.0, 3.0, 4.0}
+        self.assertEqual(self._feed(watcher, 10), 7.25)   # 3 s after the last speech (4 s), at the next poll
+
+    def test_waits_while_nothing_has_been_said(self):
+        watcher = speak_engines.SilenceWatcher([], 3, lambda w: True)
+        self.assertIsNone(self._feed(watcher, 10))
+
+    def test_a_pause_shorter_than_the_setting_continues(self):
+        watcher = speak_engines.SilenceWatcher([], 3, lambda w: True)
+        self.speech = {1.0, 2.0, 4.0, 5.0}   # a 2 s pause does not stop it
+        self.assertEqual(self._feed(watcher, 12), 8.25)
+
+    def test_the_setting(self):
+        app = speak.SpeakApp.__new__(speak.SpeakApp)
+        for value, seconds in ((0, 0), (None, 0), ("2.5", 2.5), (3, 3), (0.5, 0), ("x", 0)):
+            app.config = {"auto_stop_silence_seconds": value}
+            self.assertEqual(app._auto_stop_seconds(), seconds, value)
+
+
+class TestHoldToTalk(unittest.TestCase):
+    def _app(self, held_for):
+        import time as _time
+        from types import SimpleNamespace
+        app = speak.SpeakApp.__new__(speak.SpeakApp)
+        app.is_recording, app.events = False, []
+        app.start_recording = lambda: (app.events.append("start"), setattr(app, "is_recording", True))
+        app.stop_recording = lambda: (app.events.append("stop"), setattr(app, "is_recording", False))
+        pressed = _time.monotonic()
+        fake = SimpleNamespace(GetAsyncKeyState=lambda vk: 0x8000 if _time.monotonic() - pressed < held_for else 0)
+        self.addCleanup(setattr, speak, "_user32", speak._user32)
+        speak._user32 = fake
+        return app
+
+    def test_holding_records_until_release(self):
+        app = self._app(held_for=0.7)
+        app.hold_to_talk(0x77)
+        self.assertEqual(app.events, ["start", "stop"])
+
+    def test_a_tap_keeps_recording_until_the_next_tap(self):
+        app = self._app(held_for=0.1)
+        app.hold_to_talk(0x77)
+        self.assertEqual(app.events, ["start"])
+        self.assertTrue(app.is_recording)
+        app.hold_to_talk(0x77)   # the next tap
+        self.assertEqual(app.events, ["start", "stop"])
+
+
+class TestShutdownOnce(unittest.TestCase):
+    def _app(self):
+        import queue
+        import threading
+        from types import SimpleNamespace
+        app = speak.SpeakApp.__new__(speak.SpeakApp)
+        app.calls = calls = []
+        app.lock, app._shutdown_done = threading.Lock(), threading.Event()
+        app._shut_down, app.running, app.jobs, app._pending_restore = False, True, queue.Queue(), None
+        app.is_recording = False
+        app.stop_recording = lambda: calls.append("stop recording")
+        app.meetings = SimpleNamespace(shutdown=lambda: calls.append("meetings"))
+        app.unregister_hotkeys = lambda: calls.append("hotkeys")
+        app.flush_clipboard_restore = lambda: calls.append("clipboard")
+        app.tray = SimpleNamespace(remove=lambda: calls.append("tray"))
+        return app
+
+    def test_shutdown_runs_once_and_removes_the_tray_icon_first(self):
+        app = self._app()
+        app.shutdown()
+        app.shutdown()
+        self.assertEqual(app.calls, ["tray", "hotkeys", "meetings", "clipboard"])
+        self.assertFalse(app.running)
+        self.assertIsNone(app.jobs.get_nowait())   # the worker's stop signal
+
+    def test_a_dictation_being_recorded_is_kept(self):
+        app = self._app()
+        app.is_recording = True
+        app.shutdown(wait=0)
+        self.assertIn("stop recording", app.calls)
+
+    def test_ctrl_c_during_the_wait_still_finishes_the_shutdown(self):
+        import time as _time
+        app = self._app()
+        app.jobs.put("a dictation in progress")
+        real_sleep = speak.time.sleep
+
+        def interrupted(seconds):
+            raise KeyboardInterrupt
+        speak.time.sleep = interrupted
+        try:
+            app.shutdown()
+        finally:
+            speak.time.sleep = real_sleep
+        self.assertEqual(app.calls[-1], "clipboard")
+        self.assertTrue(app._shutdown_done.is_set())
+
+    def test_a_second_shutdown_waits_for_the_first(self):
+        import threading
+        import time as _time
+        app = self._app()
+        app.jobs.put("a dictation in progress")
+        first = threading.Thread(target=app.shutdown, kwargs={"wait": 0.5})
+        first.start()
+        _time.sleep(0.1)
+        t0 = _time.monotonic()
+        app.shutdown(wait=0.5)   # e.g. the main thread after the close handler
+        self.assertGreater(_time.monotonic() - t0, 0.2)
+        self.assertTrue(app._shutdown_done.is_set())
+        first.join()
+
+
+class TestPhase5ReviewCases(unittest.TestCase):
+    """Inputs from the adversarial review of Phase 5."""
+
+    def test_a_key_released_while_the_microphone_opens_is_a_tap(self):
+        import time as _time
+        from types import SimpleNamespace
+        app = speak.SpeakApp.__new__(speak.SpeakApp)
+        app.is_recording, app._holding, events = False, False, []
+
+        def slow_start():
+            _time.sleep(0.6)   # a slow device: longer than HOLD_SECONDS
+            events.append("start")
+            app.is_recording = True
+        app.start_recording = slow_start
+        app.stop_recording = lambda: (events.append("stop"), setattr(app, "is_recording", False))
+        pressed = _time.monotonic()
+        self.addCleanup(setattr, speak, "_user32", speak._user32)
+        speak._user32 = SimpleNamespace(GetAsyncKeyState=lambda vk: 0x8000 if _time.monotonic() - pressed < 0.2 else 0)
+        app.hold_to_talk(0x77)
+        self.assertEqual(events, ["start"])   # a tap: still recording
+
+    def test_auto_stop_only_stops_its_own_dictation_and_not_while_held(self):
+        import threading
+        app = speak.SpeakApp.__new__(speak.SpeakApp)
+        app.lock, app.is_recording, app._holding = threading.Lock(), True, False
+        app.config = {"auto_stop_silence_seconds": 2}
+        stopped = []
+        app.stop_recording = lambda: stopped.append(1)
+        old, new = object(), object()
+        app.silence = new
+        self.assertTrue(app._stop_on_silence(old))      # an old watcher: nothing to stop
+        app._holding = True
+        self.assertFalse(app._stop_on_silence(new))     # held: go on watching
+        app._holding = False
+        self.assertTrue(app._stop_on_silence(new))
+        import time as _time
+        deadline = _time.monotonic() + 2
+        while not stopped and _time.monotonic() < deadline:
+            _time.sleep(0.01)
+        self.assertEqual(stopped, [1])
+
+    def test_the_watcher_keeps_watching_when_the_stop_is_refused(self):
+        calls = []
+        watcher = speak_engines.SilenceWatcher([], 2, lambda w: calls.append(1) or False)
+        vad = speak_engines._speech_timestamps
+        self.addCleanup(setattr, speak_engines, "_speech_timestamps", vad)
+        speak_engines._speech_timestamps = lambda audio: [{"start": 0, "end": len(audio)}]
+        watcher.check(np.zeros(16000, np.float32))   # speech
+        speak_engines._speech_timestamps = lambda audio: []
+        self.assertFalse(watcher.check(np.zeros(16000, np.float32)))   # 1 s of silence
+        self.assertTrue(watcher.check(np.zeros(16000, np.float32)))    # 2 s
+        self.assertEqual(watcher.last_speech, 16000)
+
+    def test_the_console_close_handler_shuts_down(self):
+        app = speak.SpeakApp.__new__(speak.SpeakApp)
+        calls = []
+        app.shutdown = lambda wait=30.0: calls.append(wait)
+        self.assertFalse(app._on_console_close(0))   # Ctrl+C: Python's own handling
+        self.assertTrue(app._on_console_close(2))    # the window's close button
+        self.assertEqual(calls, [3.0])                # inside Windows' 5 s
+
+    def test_meeting_start_and_stop_update_the_tray(self):
+        from types import SimpleNamespace
+        manager = sm.MeetingManager.__new__(sm.MeetingManager)
+        refreshed = []
+        manager.app = SimpleNamespace(refresh_tray=lambda: refreshed.append(1))
+        manager._refresh_tray()
+        manager.app = SimpleNamespace()   # an app without a tray (tests, --transcribe-meeting)
+        manager._refresh_tray()
+        self.assertEqual(refreshed, [1])
+
+
 if __name__ == "__main__":
     unittest.main()

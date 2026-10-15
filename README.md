@@ -30,6 +30,8 @@ Everything runs on your own CPU. No audio or text leaves your computer, there is
 - **Multilingual.** English, Danish, German and French, auto-detected or locked to one language.
 - **Learns your words.** Add names, products and jargon to a personal dictionary. If Speak mishears a word, fix it in your document, select the sentence, press **Ctrl+Alt+L**, and Speak remembers the correction.
 - **Meeting transcripts.** Press **Ctrl+Alt+M** to record a Teams, Zoom or in-room meeting. Speak writes a transcript that shows who said what (*Me*, *Person 1*, *Person 2*...), with a summary and action items. Also offline.
+- **Tap or hold.** Tap the hotkey to start and again to stop, or switch on *hold to talk* and speak while you hold it. Speak can also stop by itself after a few seconds of silence.
+- **Always visible.** An icon in the notification area shows whether Speak is ready, listening, writing or recording a meeting, with a menu to start, stop or quit.
 - **No admin rights.** Runs entirely in Windows user space, with no services, drivers or firewall prompts.
 - **Fast on a laptop CPU.** Short phrases appear in about 1 second, and longer dictations in about 2 to 3 seconds.
 
@@ -222,6 +224,9 @@ Settings are saved to `speak_config.json` when you change them in the app. You c
 | `paste_mode` | `auto` | `auto`, `typing` or `clipboard` |
 | `whisper_threads` | `4` | CPU threads for Whisper |
 | `llm_threads` | `6` | CPU threads for Qwen |
+| `hotkey_mode` | `toggle` | `toggle`: tap to start, tap to stop. `hold`: hold the hotkey while you speak and release it to insert; a short tap still works as a toggle. Also in the `h` menu |
+| `auto_stop_silence_seconds` | `0` | Stop a dictation by itself after this many seconds without speech, once you have spoken (1 or more; `0` turns it off). Not while you hold the hotkey in hold-to-talk mode |
+| `tray_icon` | `true` | An icon in the notification area: Speak's icon when ready, a red dot while it listens, an orange dot while it writes, a purple dot during a meeting. Right-click it to start or stop a dictation or meeting, show the window or quit (while that menu is open, the hotkeys wait). Clicking the icon brings the Speak window to the front; in Windows Terminal that works only while Speak is the active tab |
 | `live_transcription` | `true` | Long dictations (over about 20 seconds) are transcribed in pieces while you speak, so after you stop only the last piece is left. Shorter ones are not affected |
 | `llm_fast_path` | `true` | Skip the AI step for short, clean phrases. A filler at the start (*um*, *øh*) does not stop a phrase from counting as clean: Speak removes it itself (in German, *um* is a word and stays) |
 | `warm_up` | `true` | Warm up both models at startup so the first dictation is fast |
@@ -268,6 +273,7 @@ Speak/
 ├── speak_engines.py          # Speech-to-text (Whisper) and AI cleanup (Qwen)
 ├── speak_insert.py           # Putting text into the active window (paste or typing)
 ├── speak_base.py             # Paths, the log, Windows handles shared by the modules
+├── speak_tray.py             # The notification-area icon and its menu
 ├── speak_dictionary.py       # Personal dictionary and learning from corrections
 ├── speak_text.py             # Text rules: fast path, fillers, filter for text Whisper invents
 ├── speak_meeting.py          # Meeting mode: recording, speaker detection, transcript, summary

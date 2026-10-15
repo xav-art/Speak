@@ -57,8 +57,10 @@ import speak_engines
 import speak_insert
 from speak_base import ALLOWED_LANGUAGES, LOCAL_LLM_DIR, MODELS_DIR, _kernel32, _user32, log
 from speak_engines import (CLEANUP_EXAMPLES, CLEANUP_SYSTEM_PROMPT, LANGUAGE_NOTES, LOCAL_LLM_MODELS,
-                           MEETING_TURN_NOTE, WHISPER_MODELS, EnginesMixin, LiveTranscriber, build_cleanup_prompt,
-                           download_file, download_models, ensure_local_llm, get_dir_size_str)
+                           MEETING_TURN_NOTE, WHISPER_MODELS, EnginesMixin, LiveTranscriber, SilenceWatcher,
+                           build_cleanup_prompt, download_file, download_models, ensure_local_llm,
+                           get_dir_size_str)
+from speak_tray import TrayIcon, show_console
 from speak_insert import (EXTENDED_KEYS, INPUT, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY,
                           KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, PM_REMOVE, VK_C, VK_CONTROL, VK_INSERT, VK_LWIN,
                           VK_MENU, VK_RETURN, VK_RWIN, VK_SHIFT, VK_V, InsertionMixin, build_key_inputs,
@@ -98,6 +100,9 @@ def prepare_console():
         pass
 
 _CONFIG_LOCK = threading.Lock()
+_CONSOLE_HANDLER = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.DWORD)
+_kernel32.SetConsoleCtrlHandler.argtypes = [_CONSOLE_HANDLER, wintypes.BOOL]
+_kernel32.SetConsoleCtrlHandler.restype = wintypes.BOOL
 
 
 def load_config(path=None):
@@ -115,6 +120,9 @@ def load_config(path=None):
         "speculative_decoding": False,
         "llm_fast_path": True,
         "live_transcription": True,
+        "hotkey_mode": "toggle",
+        "auto_stop_silence_seconds": 0,
+        "tray_icon": True,
         "language_check_short_phrases": True,
         "warm_up": True,
         "high_priority": True,
@@ -203,6 +211,12 @@ class SpeakApp(EnginesMixin, InsertionMixin):
 
         self.running = True
         self.hotkey_rebind_event = threading.Event()
+        self.hotkey_vks = {}       # dictation hotkey id -> virtual key, for hold to talk
+        self.tray = None
+        self.silence = None
+        self._holding = False      # the hold-to-talk key is down
+        self._shut_down = False
+        self._shutdown_done = threading.Event()
 
         # Engines (Whisper + LLM) are used by exactly one thread at a time:
         # the transcription worker, or the console when it swaps a model.
@@ -266,6 +280,7 @@ class SpeakApp(EnginesMixin, InsertionMixin):
                 log(f"[Error] Worker failure: {e}")
             finally:
                 self.jobs.task_done()
+                self.refresh_tray()
 
     def _normalize_key(self, key_str):
         k = str(key_str).strip().lstrip("^").strip()
@@ -335,6 +350,11 @@ class SpeakApp(EnginesMixin, InsertionMixin):
                     # Long dictations: pieces are transcribed while the user speaks.
                     self.live = LiveTranscriber(self, self.audio_frames, self.sample_rate)
                     self.live.start()
+                self.silence = None
+                silence = self._auto_stop_seconds()
+                if silence:
+                    self.silence = SilenceWatcher(self.audio_frames, silence, self._stop_on_silence, self.sample_rate)
+                    self.silence.start()
             except Exception as e:
                 self.is_recording = False
                 log(f"[Audio Error] Could not open microphone: {e}")
@@ -344,7 +364,11 @@ class SpeakApp(EnginesMixin, InsertionMixin):
                 return
 
         threading.Thread(target=self.play_sound, args=("start",), daemon=True).start()
-        log("\n[LISTENING...] Speak now... (Tap hotkey again to stop and insert)")
+        self.refresh_tray()
+        if self.config.get("hotkey_mode") == "hold":
+            log("\n[LISTENING...] Speak now... (Release the hotkey to insert; after a short tap, tap again)")
+        else:
+            log("\n[LISTENING...] Speak now... (Tap hotkey again to stop and insert)")
 
     def stop_recording(self):
         with self.lock:
@@ -358,10 +382,14 @@ class SpeakApp(EnginesMixin, InsertionMixin):
                 pass
             captured = list(self.audio_frames)
             live, self.live = self.live, None
+            if self.silence is not None:
+                self.silence.stop_event.set()
+                self.silence = None
 
         threading.Thread(target=self.play_sound, args=("stop",), daemon=True).start()
 
         if not captured:
+            self.refresh_tray()
             if live:
                 live.stop_event.set()
             log("[Warning] No audio recorded.")
@@ -374,6 +402,7 @@ class SpeakApp(EnginesMixin, InsertionMixin):
             if live:
                 live.stop_event.set()
             log(f"[Ignored] Audio too short ({duration:.2f}s).")
+            self.refresh_tray()
             return
 
         pending = self.jobs.unfinished_tasks
@@ -382,6 +411,71 @@ class SpeakApp(EnginesMixin, InsertionMixin):
         else:
             log(f"[TRANSCRIBING] Processing {duration:.1f}s of speech using faster-whisper-{self.model_size}...")
         self.jobs.put((audio_data, live))
+        self.refresh_tray()
+
+    def _auto_stop_seconds(self):
+        try:
+            seconds = float(self.config.get("auto_stop_silence_seconds") or 0)
+        except (TypeError, ValueError):
+            return 0
+        return seconds if seconds >= 1 else 0   # under a second would cut off normal pauses
+
+    def _stop_on_silence(self, watcher):
+        """The SilenceWatcher's call. Not while the hold-to-talk key is held
+        (the user is still talking, or pausing on purpose), and only for the
+        dictation that watcher belongs to."""
+        if self._holding:
+            return False
+        with self.lock:
+            if self.silence is not watcher or not self.is_recording:
+                return True   # that dictation has ended: nothing to stop
+        log(f"[Auto-stop] {self._auto_stop_seconds():g} s without speech: stopping.")
+        threading.Thread(target=self.stop_recording, daemon=True).start()
+        return True
+
+    HOLD_SECONDS = 0.5   # held longer than this: release stops (hold to talk); shorter: a tap
+
+    def hold_to_talk(self, vk):
+        """hotkey_mode "hold": recording runs while the key is held. A short
+        tap still starts a dictation that the next tap stops, so tapping
+        works as before. Runs on its own thread per key press."""
+        if self.is_recording:
+            self.stop_recording()   # the tap that ends a tapped dictation
+            return
+        pressed = time.monotonic()
+        self.start_recording()
+        # Released while the microphone was opening (a slow device can take
+        # half a second): that was a tap, whatever the clock says.
+        if vk is None or not self.is_recording:
+            return
+        if not _user32.GetAsyncKeyState(vk) & 0x8000:
+            if time.monotonic() - pressed >= self.HOLD_SECONDS:
+                log("[Hotkey] The microphone took a moment to open, so this counts as a tap: "
+                    "tap again to insert.")
+            return
+        self._holding = True
+        try:
+            while self.is_recording and _user32.GetAsyncKeyState(vk) & 0x8000:
+                time.sleep(0.02)
+        finally:
+            self._holding = False
+        if self.is_recording and time.monotonic() - pressed >= self.HOLD_SECONDS:
+            self.stop_recording()
+
+    def refresh_tray(self):
+        """Shows what Speak is doing: recording, a meeting, working, or ready."""
+        tray = self.tray
+        if tray is None:
+            return
+        if self.is_recording:
+            state = "recording"
+        elif self.meetings.is_recording:
+            state = "meeting"
+        elif self.jobs.unfinished_tasks or self.meetings.jobs.unfinished_tasks:
+            state = "working"
+        else:
+            state = "idle"
+        tray.set_state(state)
 
     def _process_worker(self, job):
         audio_data, live = job if isinstance(job, tuple) else (job, None)
@@ -577,8 +671,10 @@ class SpeakApp(EnginesMixin, InsertionMixin):
             hotkeys_to_bind.append((self.MEETING_HOTKEY_ID, mods | MOD_NOREPEAT, vk, f"Record meeting ({self.meetings.hotkey})"))
 
         success_count = 0
+        self.hotkey_vks = {}
         for hid, mods, vk_code, desc in hotkeys_to_bind:
             if _user32.RegisterHotKey(None, hid, mods, vk_code):
+                self.hotkey_vks[hid] = vk_code
                 if hid in (self.LEARN_HOTKEY_ID, self.MEETING_HOTKEY_ID):
                     self.registered_ids.append(hid)
                     log(f"[Hotkey Registered] {desc} -> ACTIVE")
@@ -596,6 +692,7 @@ class SpeakApp(EnginesMixin, InsertionMixin):
             f8_vk = FUNCTION_KEYS["F8"]
             if _user32.RegisterHotKey(None, 1, MOD_NONE | MOD_NOREPEAT, f8_vk):
                 self.registered_ids.append(1)
+                self.hotkey_vks[1] = f8_vk
                 log("[Hotkey Registered] Fallback to F8 -> ACTIVE")
 
     def unregister_hotkeys(self):
@@ -626,6 +723,17 @@ class SpeakApp(EnginesMixin, InsertionMixin):
 
     def _listener_loop(self):
         self.register_hotkeys()
+        if self.config.get("tray_icon", True):
+            # On this thread: its message loop delivers the icon's clicks.
+            self.tray = TrayIcon({
+                "dictation": lambda: threading.Thread(target=self.toggle_recording, daemon=True).start(),
+                "meeting": lambda: threading.Thread(target=self.meetings.toggle, daemon=True).start(),
+                "show": show_console,
+                "quit": self._quit_from_tray,
+                "status": lambda: (self.is_recording, self.meetings.is_recording),
+            })
+            if not self.tray.create():
+                self.tray = None
         msg = wintypes.MSG()
         while self.running:
             if self.hotkey_rebind_event.is_set():
@@ -640,12 +748,25 @@ class SpeakApp(EnginesMixin, InsertionMixin):
                         threading.Thread(target=self.learn_from_selection, daemon=True).start()
                     elif msg.wParam == self.MEETING_HOTKEY_ID:
                         threading.Thread(target=self.meetings.toggle, daemon=True).start()
+                    elif self.config.get("hotkey_mode") == "hold":
+                        vk = self.hotkey_vks.get(msg.wParam)
+                        threading.Thread(target=self.hold_to_talk, args=(vk,), daemon=True).start()
                     else:
                         self.toggle_recording()
                 _user32.TranslateMessage(ctypes.byref(msg))
                 _user32.DispatchMessageW(ctypes.byref(msg))
             time.sleep(0.02)
         self.unregister_hotkeys()
+        if self.tray is not None:
+            self.tray.destroy()
+
+    def _quit_from_tray(self):
+        """The tray menu's Quit: the same shutdown as typing q. The console
+        is waiting in input(), which cannot be woken cleanly, so the process
+        ends here once everything is saved."""
+        log("\nQuitting (from the tray icon)...")
+        self.shutdown()
+        os._exit(0)
 
     def get_ai_status_str(self):
         if self.ai_mode == "local" and self.local_llm:
@@ -663,7 +784,10 @@ class SpeakApp(EnginesMixin, InsertionMixin):
         log("\n" + "=" * 68)
         log("                   SPEAK - LOCAL VOICE-TO-TEXT                 ")
         log("=" * 68)
-        log(f"Active Hotkey  : [{self.hotkey_req}] (Tap to start, Tap to stop & paste)")
+        if self.config.get("hotkey_mode") == "hold":
+            log(f"Active Hotkey  : [{self.hotkey_req}] (Hold while you speak, or tap to start and tap to stop)")
+        else:
+            log(f"Active Hotkey  : [{self.hotkey_req}] (Tap to start, Tap to stop & paste)")
         log(f"Whisper Model  : faster-whisper-{self.model_size} (Local CPU int8)")
         log(f"Whisper Path   : {self.model_storage_path} ({size_str})")
         log(f"AI Formatting  : {ai_status}")
@@ -748,7 +872,22 @@ class SpeakApp(EnginesMixin, InsertionMixin):
             except Exception as e:
                 log(f"Could not open the folder: {e}")
 
+    def _on_console_close(self, event):
+        """Windows' console control handler. Closing the window, logging off
+        or shutting down ends the process right after this returns: save a
+        running meeting and remove the tray icon first. Ctrl+C is left to
+        Python (it stops the menu loop)."""
+        if event in (2, 5, 6):   # CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT
+            try:
+                self.shutdown(wait=3.0)   # Windows ends the process about 5 s after this starts
+            except Exception:
+                pass
+            return True
+        return False
+
     def run(self, first_run=False):
+        self._console_handler = _CONSOLE_HANDLER(self._on_console_close)   # kept alive: Windows calls it
+        _kernel32.SetConsoleCtrlHandler(self._console_handler, True)
         listener_thread = threading.Thread(target=self._listener_loop, daemon=True)
         listener_thread.start()
 
@@ -775,9 +914,17 @@ class SpeakApp(EnginesMixin, InsertionMixin):
                     log("  >   - Shift + the key next to Left Shift")
                     log("  <>  - Either plain tap OR Shift tap triggers dictation")
                     log("  F8, F9, F10, Pause, CapsLock, Insert")
-                    new_h = input("Enter new hotkey [< / > / <> / F8 / etc.]: ").strip()
+                    new_h = input("Enter new hotkey [< / > / <> / F8 / etc.] (Enter keeps it): ").strip()
                     if new_h:
                         self.set_hotkey(new_h)
+                    hold = self.config.get("hotkey_mode") == "hold"
+                    log("Hold to talk: hold the hotkey while you speak and release it to insert the text.")
+                    log("A short tap still starts a dictation that the next tap ends.")
+                    answer = input(f"Hold to talk? [y/n] (now {'on' if hold else 'off'}, Enter keeps it): ").strip().lower()
+                    if answer in ("y", "yes", "n", "no"):
+                        self.config["hotkey_mode"] = "hold" if answer.startswith("y") else "toggle"
+                        save_config(self.config)
+                        log(f"[HOTKEY] Hold to talk is {'on' if answer.startswith('y') else 'off'} (saved).")
                     self.print_status_banner()
 
                 elif cmd in ("a", "ai", "format"):
@@ -934,15 +1081,49 @@ class SpeakApp(EnginesMixin, InsertionMixin):
         except KeyboardInterrupt:
             pass
         finally:
+            self.shutdown()
+
+    def shutdown(self, wait=30.0):
+        """Stops Speak: the tray icon and hotkeys go first (milliseconds), a
+        dictation being recorded is kept, a running meeting is saved for
+        later, dictations already spoken are typed in (for up to `wait`
+        seconds) and the user's clipboard is given back. One shutdown at a
+        time: a second caller waits for the first to finish."""
+        with self.lock:
+            first = not self._shut_down
+            self._shut_down = True
+        if not first:
+            self._shutdown_done.wait(wait + 10)
+            return
+        try:
             self.running = False
-            self.meetings.shutdown()
+            if self.tray is not None:
+                self.tray.remove()   # the window itself belongs to the listener thread
             self.unregister_hotkeys()
-            self.flush_clipboard_restore()
+            if self.is_recording:
+                self.stop_recording()   # what is being said is queued like any dictation
+            self.meetings.shutdown()
+            deadline = time.monotonic() + wait
+            if self.jobs.unfinished_tasks and wait > 0:
+                log(f"Finishing {self.jobs.unfinished_tasks} dictation(s) first... (Ctrl+C skips)")
             try:
-                self.jobs.put(None)
-            except Exception:
-                pass
-            log("Speak stopped. Goodbye!")
+                while self.jobs.unfinished_tasks and time.monotonic() < deadline:
+                    time.sleep(0.1)
+                if self._pending_restore is not None:
+                    # The target app may not have pasted yet: wait as a normal restore does.
+                    time.sleep(self.CLIPBOARD_RESTORE_DELAY)
+            except KeyboardInterrupt:
+                log("Skipped.")
+        finally:
+            try:
+                self.flush_clipboard_restore()
+            finally:
+                try:
+                    self.jobs.put(None)
+                except Exception:
+                    pass
+                self._shutdown_done.set()
+                log("Speak stopped. Goodbye!")
 
 
 if __name__ == "__main__":

@@ -848,3 +848,63 @@ class LiveTranscriber:
 def _speech_timestamps(audio):
     from faster_whisper.vad import VadOptions, get_speech_timestamps
     return get_speech_timestamps(audio, VadOptions(min_silence_duration_ms=300, speech_pad_ms=100))
+
+
+class SilenceWatcher:
+    """Stops a dictation after `seconds` without speech, once the user has
+    spoken (config auto_stop_silence_seconds; 0 turns it off). Reads the
+    recorder's frames on its own thread four times a second and runs the VAD
+    on the new audio only (with a little context), so a long setting costs
+    no more than a short one. on_silence(watcher) returns True when it
+    stopped the dictation; False (the user is holding the hotkey) lets the
+    watcher go on."""
+
+    POLL_SECONDS = 0.25
+    CONTEXT_SECONDS = 0.5   # the VAD needs a little audio before the new samples
+
+    def __init__(self, frames, seconds, on_silence, sample_rate=16000):
+        self.frames, self.seconds, self.on_silence, self.sr = frames, float(seconds), on_silence, sample_rate
+        self.context = np.zeros(0, np.float32)
+        self._taken = 0
+        self.position = 0           # samples seen
+        self.last_speech = None     # sample position where speech was last heard
+        self.stop_event = threading.Event()
+        self.thread = None
+
+    @property
+    def heard(self):
+        return self.last_speech is not None
+
+    def start(self):
+        self.thread = threading.Thread(target=self._run, name="speak-silence", daemon=True)
+        self.thread.start()
+
+    def _run(self):
+        while not self.stop_event.wait(self.POLL_SECONDS):
+            try:
+                if self.check() and not self.stop_event.is_set():
+                    if self.on_silence(self):
+                        self.stop_event.set()
+                    else:
+                        self.last_speech = self.position   # held: count the silence again from now
+            except Exception as e:
+                log(f"[Auto-stop Warning] {e}; stop the dictation with the hotkey.")
+                return
+
+    def check(self, audio=None):
+        """True when the dictation should stop. `audio` (new samples) is for
+        tests; the thread reads the recorder's frames."""
+        if audio is None:
+            n = len(self.frames)   # the audio callback only appends
+            if n <= self._taken:
+                return False
+            audio = np.concatenate(self.frames[self._taken:n], axis=0).reshape(-1)
+            self._taken = n
+        window = np.concatenate([self.context, audio])
+        start = self.position - len(self.context)   # sample position of window[0]
+        speech = _speech_timestamps(window)
+        if speech:
+            self.last_speech = max(self.last_speech or 0, start + speech[-1]["end"])
+        self.position += len(audio)
+        self.context = window[-int(self.CONTEXT_SECONDS * self.sr):]
+        return self.heard and self.position - self.last_speech >= self.seconds * self.sr

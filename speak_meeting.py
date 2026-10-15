@@ -1266,6 +1266,7 @@ class MeetingManager:
                 return
             self.recorder = rec
         _set_title("Speak - RECORDING MEETING")
+        self._refresh_tray()
         self.app.play_sound("start")
         self.log(f"\n[MEETING] Recording the microphone and system audio. Press {self.hotkey} again to stop.")
         self.log("          Remember to tell the other participants that you are recording.")
@@ -1282,10 +1283,11 @@ class MeetingManager:
         meta = rec.stop()
         _set_title("Speak - Local Voice Dictation")
         self.app.play_sound("stop")
+        self.submit(rec.folder)   # before the tray refresh: "working", not "ready"
+        self._refresh_tray()
         minutes = (datetime.datetime.fromisoformat(meta["stopped"]) - datetime.datetime.fromisoformat(meta["started"])).total_seconds() / 60
         self.log(f"[MEETING] Recording stopped ({minutes:.0f} min). Transcribing in the background; "
                  "dictation keeps working meanwhile.")
-        self.submit(rec.folder)
 
     def shutdown(self):
         """On quit: finalize a running recording so it can be processed later."""
@@ -1329,6 +1331,12 @@ class MeetingManager:
             finally:
                 self.current_job = None
                 self.jobs.task_done()
+                self._refresh_tray()
+
+    def _refresh_tray(self):
+        refresh = getattr(self.app, "refresh_tray", None)
+        if refresh:
+            refresh()
 
     # -- processing --
     def _load_streams(self, path):
