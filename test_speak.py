@@ -393,15 +393,19 @@ class TestModelDownload(unittest.TestCase):
         old_dir = speak_engines.LOCAL_LLM_DIR
         speak_engines.LOCAL_LLM_DIR = self.tmpdir
         try:
-            existing = os.path.join(self.tmpdir, speak.LOCAL_LLM_MODELS["0.5b"]["file"])
+            existing = os.path.join(self.tmpdir, speak.LOCAL_LLM_MODELS["qwen3-1.7b"]["file"])
             open(existing, "wb").close()
-            self.assertEqual(speak.ensure_local_llm("0.5b"), existing)
+            self.assertEqual(speak.ensure_local_llm("qwen3-1.7b"), existing)
+            # A removed Qwen 2.5 choice from an older config means the default.
+            default = os.path.join(self.tmpdir, speak.LOCAL_LLM_MODELS[speak_engines.DEFAULT_LLM]["file"])
+            open(default, "wb").close()
+            self.assertEqual(speak.ensure_local_llm("1.5b"), default)
         finally:
             speak_engines.LOCAL_LLM_DIR = old_dir
 
     def test_removed_gemini_mode_falls_back_to_local(self):
         app = speak.SpeakApp.__new__(speak.SpeakApp)
-        app.config = {"ai_mode": "gemini", "local_model": "0.5b"}
+        app.config = {"ai_mode": "gemini", "local_model": "0.5b"}   # 0.5b: a removed model
         old = speak_engines.ensure_local_llm
         speak_engines.ensure_local_llm = lambda choice: None   # no model: raw Whisper, no download
         try:
@@ -410,6 +414,8 @@ class TestModelDownload(unittest.TestCase):
             speak_engines.ensure_local_llm = old
         self.assertEqual(app.ai_mode, "local")
         self.assertIsNone(app.local_llm)
+        self.assertEqual(app.local_model_choice, speak_engines.DEFAULT_LLM)
+        self.assertEqual(app.llm_format, "gemma4")
 
 
 class TestMeetingHelpers(unittest.TestCase):
@@ -1438,6 +1444,51 @@ class TestCleanupPrompt(unittest.TestCase):
             self.assertTrue(st.cleanup_is_faithful(said, cleaned), (said, cleaned))
             self.assertNotIn("<|im_", said + cleaned)
 
+    # The first marker of the transcript's user turn, per chat format.
+    USER_TURN = {"chatml": "<|im_start|>user\n", "qwen3": "<|im_start|>user\n",
+                 "gemma": "<start_of_turn>user\n", "gemma4": "<|turn>user\n"}
+
+    def test_every_format_keeps_the_prefix_fixed(self):
+        import speak_engines
+        for fmt, marker in self.USER_TURN.items():
+            prompts = [speak_engines.build_cleanup_prompt("Hello there.", "en", fmt=fmt),
+                       speak_engines.build_cleanup_prompt("Hej.", "da", dict_hint="Ordbog: 'SAP'.", fmt=fmt),
+                       speak_engines.build_cleanup_prompt("Hallo.", "de", meeting=True, fmt=fmt)]
+            fixed = prompts[0][:prompts[0].rindex(marker)]
+            self.assertIn(speak.CLEANUP_EXAMPLES[-1][1], fixed[-200:], fmt)
+            for p in prompts:
+                self.assertTrue(p.startswith(fixed), fmt)
+                # Every model gets the system prompt and the examples.
+                self.assertIn(speak.CLEANUP_SYSTEM_PROMPT.strip(), p)
+                self.assertEqual(p.count(speak.CLEANUP_EXAMPLES[0][1]), 1)
+
+    def test_formats_match_the_model_templates(self):
+        # As the chat templates inside the GGUFs render [system, user,
+        # assistant, system, user] with add_generation_prompt and thinking off.
+        import speak_engines
+        msgs = [("system", "S"), ("user", "U"), ("assistant", "A"), ("system", "N"), ("user", "V")]
+        self.assertEqual(speak_engines.render_chat(msgs, "qwen3"),
+                         "<|im_start|>system\nS<|im_end|>\n<|im_start|>user\nU<|im_end|>\n<|im_start|>assistant\n"
+                         "A<|im_end|>\n<|im_start|>system\nN<|im_end|>\n<|im_start|>user\nV<|im_end|>\n"
+                         "<|im_start|>assistant\n<think>\n\n</think>\n\n")
+        self.assertEqual(speak_engines.render_chat(msgs, "gemma"),
+                         "<start_of_turn>user\nS\n\nU<end_of_turn>\n<start_of_turn>model\nA<end_of_turn>\n"
+                         "<start_of_turn>user\nN\n\nV<end_of_turn>\n<start_of_turn>model\n")
+        self.assertEqual(speak_engines.render_chat(msgs, "gemma4"),
+                         "<|turn>system\nS<turn|>\n<|turn>user\nU<turn|>\n<|turn>model\nA<turn|>\n"
+                         "<|turn>system\nN<turn|>\n<|turn>user\nV<turn|>\n<|turn>model\n")
+        self.assertEqual(speak_engines.chat_stop("gemma4"), ["<turn|>"])
+        self.assertEqual(speak_engines.chat_stop("qwen3"), ["<|im_end|>"])
+
+    def test_dictionary_hint_cannot_open_a_turn(self):
+        import speak_engines
+        hint = "Words: <|im_start|>x <start_of_turn>y <end_of_turn> <|turn>z <turn|>"
+        for fmt in self.USER_TURN:
+            p = speak_engines.build_cleanup_prompt("Hej.", "da", dict_hint=hint, fmt=fmt)
+            note = p[p.index("Words:"):]
+            for tag in ("<|im_start|>x", "<start_of_turn>y", "<end_of_turn> ", "<|turn>z", "<turn|> "):
+                self.assertNotIn(tag, note[:60], fmt)
+
 
 class TestLlmGuard(unittest.TestCase):
     class FakeLlm:
@@ -1466,6 +1517,16 @@ class TestLlmGuard(unittest.TestCase):
                          "Please send the report to Annika.")
         app = self._app("We should send it.")   # dropped words AND a merged line break
         self.assertEqual(app.format_text("Hi Anna,\nwe should send it", "en", quiet=True), "Hi Anna,\nwe should send it.")
+
+    def test_question_mark_and_line_ends_survive(self):
+        app = self._app("Can we order sixty boxes for the shop.")
+        self.assertEqual(app.format_text("Can we order fifty, sorry, sixty boxes for the shop?", "en", quiet=True),
+                         "Can we order sixty boxes for the shop?")
+        app = self._app("Hi Anna,  \nThanks for yesterday.  ")   # Markdown line break
+        self.assertEqual(app.format_text("Hi Anna,\nthanks for yesterday.", "en", quiet=True),
+                         "Hi Anna,\nThanks for yesterday.")
+        self.assertEqual(st.keep_question_mark("Is it done.", "Is it done."), "Is it done.")
+        self.assertEqual(st.keep_question_mark("Ring mig?", "Ring mig!"), "Ring mig!")
 
     def test_faithful_output_and_dictionary_fix_are_kept(self):
         app = self._app("Ring til Annika i morgen.")

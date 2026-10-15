@@ -16,7 +16,7 @@
 
 </div>
 
-Speak listens when you tap a hotkey, transcribes your voice with [Whisper](https://github.com/SYSTRAN/faster-whisper), cleans up the "um"s and false starts with a small local language model ([Qwen 2.5](https://huggingface.co/Qwen)), and types the result into the app you are using: Word, Outlook, Teams, a browser, a terminal, anything.
+Speak listens when you tap a hotkey, transcribes your voice with [Whisper](https://github.com/SYSTRAN/faster-whisper), cleans up the "um"s and false starts with a small local language model ([Gemma 4 E2B](https://huggingface.co/google/gemma-4-E2B-it), or [Qwen3 1.7B](https://huggingface.co/Qwen/Qwen3-1.7B) if you prefer a smaller one), and types the result into the app you are using: Word, Outlook, Teams, a browser, a terminal, anything.
 
 Everything runs on your own CPU. No audio or text leaves your computer, there is no account, and you do not need administrator rights.
 
@@ -41,7 +41,7 @@ Everything runs on your own CPU. No audio or text leaves your computer, there is
 flowchart LR
     A[Tap hotkey<br/>and speak] --> B[Whisper<br/>speech to text]
     B --> C[Personal dictionary<br/>fixes known mishearings]
-    C --> D[Qwen 2.5 on CPU<br/>removes fillers, formats]
+    C --> D[Gemma 4 on CPU<br/>removes fillers, formats]
     D --> E[Text typed into<br/>the active app]
 ```
 
@@ -72,7 +72,7 @@ What the installer does, all inside your user account and without admin rights:
 
 - Installs Python 3.12 for your user if you do not have Python 3.10 to 3.13 (with `winget`, or the signed installer from python.org).
 - Puts Speak in `%LOCALAPPDATA%\Speak` with its own private Python environment, so it does not change anything else on your PC.
-- Downloads the speech model and the AI model once (about 1.3 GB) and checks the AI model's SHA-256 checksum.
+- Downloads the speech model and the AI model once (about 3.3 GB) and checks the AI model's SHA-256 checksum.
 - Adds **Speak** and **Uninstall Speak** to the Start Menu, a Desktop icon, and the `speak` command for terminals.
 
 No `.exe` is downloaded or run apart from Python's own signed installer, so antivirus and SmartScreen have nothing to flag. You can read [install.ps1](install.ps1) before you run it.
@@ -91,7 +91,7 @@ Open the Start Menu and choose **Uninstall Speak**. It asks whether to keep your
 
 - Windows 10 or 11 (64-bit)
 - A microphone
-- About 2 GB of free disk space and 4 GB of RAM or more (meeting mode: about 0.6 GB more, downloaded the first time you use it)
+- About 4 GB of free disk space and 8 GB of RAM or more: the AI model uses about 2.5 GB, and about 5 GB while it writes a meeting summary (with `qwen3-1.7b`: 1.1 GB less disk and 0.8 GB less RAM). Meeting mode needs about 0.6 GB more disk, downloaded the first time you use it
 - Internet access during setup only (and once, the first time you record a meeting)
 
 ### For developers
@@ -128,7 +128,7 @@ Type these in the Speak window:
 | Command | What it does |
 | :--- | :--- |
 | `h` | Change the hotkey (`<`, `>`, `<>`, `F8`, `F9`, `Pause`, `CapsLock`, ...) |
-| `a` | AI cleanup: switch between Qwen 1.5B and 0.5B, turn it off, or run a test |
+| `a` | AI cleanup: switch between Gemma 4 E2B and Qwen3 1.7B, turn it off, or run a test |
 | `d` | Personal dictionary: list, add, remove or import words |
 | `l` | Language: auto-detect, or lock to English, Danish, German or French |
 | `m` | Whisper model: `base` (fast) or `medium` (more accurate) |
@@ -197,9 +197,9 @@ How it works:
 - **Clock drift:** the microphone and the call audio run on different hardware clocks, which drift apart by up to a second an hour. Speak measures this during the recording and lines them up again before transcribing, so long meetings keep the right speaker order and echo removal.
 - **Who spoke when:** [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) speaker diarization (pyannote segmentation and NeMo TitaNet speaker embeddings, about 47 MB, no PyTorch). Speakers that match your voice sample become *Me*, everyone else *Person 1*, *Person 2* and so on, numbered in order of appearance.
 - **What was said:** Whisper `small` (more accurate on long, mixed audio than the dictation model). Each speaker's language is detected separately, so a Danish colleague stays Danish in an English meeting.
-- **Cleanup:** only turns with fillers or stutters go to Qwen, which may remove only those. Spoken commands are not applied in meetings. If the model drops or changes a word anyway, the turn is kept as spoken.
-- **Decisions and action items:** Speak finds the sentences where someone promises something (*"I will"*, *"jeg vil"*, *"jeg tjekker det"*, *"leave it with me"*; but not a habit such as *"jeg tjekker altid mails"* or a refusal such as *"det gør jeg ikke"*), asks for something (*"can you"*, *"kan du"*) or agrees on something (*"let us"*, *"lad os"*). Qwen then rewrites each one as a short to-do with its deadline. The owner comes from the transcript, not from the AI: whoever made the promise, or whoever said yes to a request. A request nobody agreed to is listed with who raised it. Every item shows when it was said, so you can check it.
-- **Summary:** Qwen writes a short summary paragraph. It is a small model, so read it before you forward it.
+- **Cleanup:** only turns with fillers or stutters go to the AI model, which may remove only those. Spoken commands are not applied in meetings. If the model drops or changes a word anyway, the turn is kept as spoken.
+- **Decisions and action items:** Speak finds the sentences where someone promises something (*"I will"*, *"jeg vil"*, *"jeg tjekker det"*, *"leave it with me"*; but not a habit such as *"jeg tjekker altid mails"* or a refusal such as *"det gør jeg ikke"*), asks for something (*"can you"*, *"kan du"*) or agrees on something (*"let us"*, *"lad os"*). The AI model then rewrites each one as a short to-do with its deadline. The owner comes from the transcript, not from the AI: whoever made the promise, or whoever said yes to a request. A request nobody agreed to is listed with who raised it. Every item shows when it was said, so you can check it.
+- **Summary:** the AI model writes a short summary paragraph. It is a small model, so read it before you forward it.
 
 Tips:
 
@@ -219,11 +219,11 @@ Settings are saved to `speak_config.json` when you change them in the app. You c
 | `model` | `base` | Whisper model: `tiny`, `base`, `small`, `medium`, `large-v3` (most accurate, slow on a laptop CPU) |
 | `language` | `null` | `null` for auto-detect, or `en`, `da`, `de`, `fr` |
 | `language_check_short_phrases` | `true` | For phrases of up to 4 seconds that Whisper hears as another language than your last one, also try your last language, and keep it if Whisper is clearly more sure of it. `true` does this on `tiny` and `base` only (measured on `medium`, the check fixed nothing and cost 3.4 s), `"always"` on every model, `false` never |
-| `ai_mode` | `local` | `local` (Qwen) or `off` (raw Whisper) |
-| `local_model` | `1.5b` | `1.5b` or `0.5b` |
+| `ai_mode` | `local` | `local` (AI cleanup) or `off` (raw Whisper) |
+| `local_model` | `gemma4-e2b` | `gemma4-e2b` (best Danish and German) or `qwen3-1.7b` (smaller, faster on long dictations). The removed `1.5b` and `0.5b` (Qwen 2.5) mean `gemma4-e2b` |
 | `paste_mode` | `auto` | `auto`, `typing` or `clipboard` |
 | `whisper_threads` | `4` | CPU threads for Whisper |
-| `llm_threads` | `6` | CPU threads for Qwen |
+| `llm_threads` | `6` | CPU threads for the AI model |
 | `hotkey_mode` | `toggle` | `toggle`: tap to start, tap to stop. `hold`: hold the hotkey while you speak and release it to insert; a short tap still works as a toggle. Also in the `h` menu |
 | `auto_stop_silence_seconds` | `0` | Stop a dictation by itself after this many seconds without speech, once you have spoken (1 or more; `0` turns it off). Not while you hold the hotkey in hold-to-talk mode |
 | `tray_icon` | `true` | An icon in the notification area: Speak's icon when ready, a red dot while it listens, an orange dot while it writes, a purple dot during a meeting. Right-click it to start or stop a dictation or meeting, show the window or quit (while that menu is open, the hotkeys wait). Clicking the icon brings the Speak window to the front; in Windows Terminal that works only while Speak is the active tab |
@@ -234,7 +234,7 @@ Settings are saved to `speak_config.json` when you change them in the app. You c
 | `meeting_hotkey` | `CTRL+ALT+M` | Hotkey that starts and stops a meeting recording |
 | `meeting_model` | `small` | Whisper model for meetings |
 | `meeting_folder` | `null` | Where transcripts go. `null` means the local `C:\Users\<you>\Documents\Speak Meetings` (never the OneDrive one) |
-| `meeting_cleanup` | `true` | Remove fillers and stutters from meeting turns with Qwen |
+| `meeting_cleanup` | `true` | Remove fillers and stutters from meeting turns with the AI model |
 | `meeting_summary` | `true` | Write a summary, decisions and action items |
 | `meeting_keep_audio` | `false` | Keep the recorded audio after the transcript is written |
 | `meeting_mic` | `null` | Microphone for meetings (part of its name). `null` means the Windows default |
@@ -247,7 +247,7 @@ Settings are saved to `speak_config.json` when you change them in the app. You c
 
 ## Performance notes
 
-Measured on an Intel Core Ultra 7 265U with `faster-whisper-base` and Qwen 2.5 1.5B:
+Measured on an Intel Core Ultra 7 265U with `faster-whisper-base` and Qwen 2.5 1.5B (the AI model before Gemma 4 E2B):
 
 | Optimization | Effect |
 | :--- | :--- |
@@ -261,6 +261,7 @@ Measured on an Intel Core Ultra 7 265U with `faster-whisper-base` and Qwen 2.5 1
 | `ABOVE_NORMAL` process priority | Chrome, Teams and Outlook cannot take the CPU during the ~2 s of processing |
 | Direct typing sends 32 characters per `SendInput` call | Insertion into terminals is about 20x faster |
 | One cleanup prompt for all four languages, with worked examples. Speak itself removes filler sounds and applies *new line*, *bullet point* and *scratch that* before the AI runs, and rejects any AI output that drops, adds or translates words | On a set of 39 dictations and meeting turns, word errors after cleanup fell from 17% to under 1%: the old per-language prompts dropped *"I think"*, *"please"* and introduction lines, and missed half the line breaks. Each AI call is also about 15% faster: the prompt stays cached when you switch language |
+| Gemma 4 E2B as the AI model (October 2026), chosen with `bench/run_cleanup_bench.py` from Qwen 2.5 1.5B, Qwen3 1.7B, Qwen3.5 0.8B and 2B, and Gemma 3 1B | On 54 hard Danish and German transcripts (run-on sentences, lowercase nouns, corrections, stutters), word errors fell from 3.1% to 2.2% (Danish 3.2% to 0.6%) and capital, punctuation and sentence-break errors halved (46 to 20). Qwen 2.5 ignored *"nej vent"* and left run-on sentences; Qwen3 1.7B has the same word errors as Gemma but twice its punctuation errors. Cost: about 35% slower on a 120-word dictation, 0.4 s on a short one, and 2.5 GB instead of 1.9 GB of RAM. Qwen3.5 was 5 to 10 times slower: llama.cpp cannot reuse the cached prompt for its recurrent layers |
 | Long dictations cleaned in sentence-aligned chunks (at line breaks first, at commas, or in equal pieces of up to 160 words, when Whisper wrote no full stops; the AI may then start a new sentence at such a split) | No silent truncation after about 100 words |
 
 Tested and rejected (kept as opt-in config keys): prompt-lookup speculative decoding (`speculative_decoding`, 2.5x *slower* on CPU with llama-cpp-python 0.3.x), flash attention (no gain), and Whisper `hotwords` (makes multi-word names stutter). On hybrid P/E-core CPUs, more Whisper threads were consistently *slower*.
@@ -270,7 +271,7 @@ Tested and rejected (kept as opt-in config keys): prompt-lookup speculative deco
 ```text
 Speak/
 ├── speak.py                  # The app: hotkeys, recording, the menu
-├── speak_engines.py          # Speech-to-text (Whisper) and AI cleanup (Qwen)
+├── speak_engines.py          # Speech-to-text (Whisper) and AI cleanup (Gemma 4 / Qwen3)
 ├── speak_insert.py           # Putting text into the active window (paste or typing)
 ├── speak_base.py             # Paths, the log, Windows handles shared by the modules
 ├── speak_tray.py             # The notification-area icon and its menu
@@ -311,7 +312,7 @@ Speak/
 .venv\Scripts\python -X utf8 bench\run_bench.py --compare bench\results\A.json bench\results\B.json
 ```
 
-It reports the word error rate (WER) per language and clip type, how often the language was detected correctly, how often the AI step was skipped, the time per stage, and any text invented on the no-speech clips. Whisper and Qwen use fixed random seeds, so most clips give the same text every run. A few hard clips do not: when Whisper is unsure it re-decodes with random sampling, which the seed does not fully control. Expect the overall WER to move by about 1.5 points between identical runs, and look at which clips changed (`--compare`) before trusting a small difference. Timings depend on what else the computer is doing: compare runs made one after the other. To rebuild the clips, see `bench\make_clips.py`.
+It reports the word error rate (WER) per language and clip type, how often the language was detected correctly, how often the AI step was skipped, the time per stage, and any text invented on the no-speech clips. Whisper and the AI model use fixed random seeds, so most clips give the same text every run. A few hard clips do not: when Whisper is unsure it re-decodes with random sampling, which the seed does not fully control. Expect the overall WER to move by about 1.5 points between identical runs, and look at which clips changed (`--compare`) before trusting a small difference. Timings depend on what else the computer is doing: compare runs made one after the other. To rebuild the clips, see `bench\make_clips.py`.
 
 Two more benchmarks use the same clips:
 

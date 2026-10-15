@@ -14,22 +14,38 @@ import numpy as np
 import speak_text
 from speak_base import ALLOWED_LANGUAGES, LOCAL_LLM_DIR, MODELS_DIR, log
 
+# Cleanup models, measured with bench/run_cleanup_bench.py on 93 transcripts
+# (54 hard Danish/German ones) against Qwen 2.5 1.5B, Qwen3.5 0.8B/2B and
+# Gemma 3 1B (October 2026). Gemma 4 E2B made half the capital, punctuation and
+# sentence errors of the others and almost none in Danish; it is about 35 %
+# slower on long dictations. Qwen3.5 is out: its recurrent layers stop
+# llama.cpp from reusing the cached prompt prefix (5-10x slower per call).
+# "format" is the chat format (render_chat).
 LOCAL_LLM_MODELS = {
-    "1.5b": {
-        "file": "qwen2.5-1.5b-instruct-q4_k_m.gguf",
-        "name": "Qwen 2.5 1.5B (Recommended: Best Danish & English, ~2s)",
-        "repo": "Qwen/Qwen2.5-1.5B-Instruct-GGUF",
-        "sha256": "6a1a2eb6d15622bf3c96857206351ba97e1af16c30d7a74ee38970e434e9407e",
-        "size": "1.1 GB"
+    "gemma4-e2b": {
+        "file": "gemma-4-E2B-it-Q4_K_M.gguf",
+        "name": "Gemma 4 E2B (Recommended: best Danish and German)",
+        "repo": "unsloth/gemma-4-E2B-it-GGUF",
+        "sha256": "740185b21d22ceb83a11c3aa62ad5842ef32c70f6096d756bbee85a1e4ec34b8",
+        "size": "3.1 GB",
+        "format": "gemma4"
     },
-    "0.5b": {
-        "file": "qwen2.5-0.5b-instruct-q4_k_m.gguf",
-        "name": "Qwen 2.5 0.5B (Ultra-Fast ~1s, 468 MB)",
-        "repo": "Qwen/Qwen2.5-0.5B-Instruct-GGUF",
-        "sha256": "74a4da8c9fdbcd15bd1f6d01d621410d31c6fc00986f5eb687824e7b93d7a9db",
-        "size": "470 MB"
+    "qwen3-1.7b": {
+        "file": "Qwen3-1.7B-Q4_K_M.gguf",
+        "name": "Qwen3 1.7B (smaller and faster on long dictations)",
+        "repo": "unsloth/Qwen3-1.7B-GGUF",
+        "sha256": "b139949c5bd74937ad8ed8c8cf3d9ffb1e99c866c823204dc42c0d91fa181897",
+        "size": "1.1 GB",
+        "format": "qwen3"
     }
 }
+DEFAULT_LLM = "gemma4-e2b"
+
+
+def llm_choice(choice):
+    """The model key to use for a configured local_model. Unknown keys (the
+    removed Qwen 2.5 "1.5b" and "0.5b" of older configs) mean the default."""
+    return choice if choice in LOCAL_LLM_MODELS else DEFAULT_LLM
 
 def get_dir_size_str(path):
     if not os.path.exists(path):
@@ -87,7 +103,7 @@ def download_file(url, dest, sha256, label):
 def ensure_local_llm(choice):
     """Path of the Qwen GGUF for this choice, downloading it once if missing.
     Returns None when the model is not available."""
-    info = LOCAL_LLM_MODELS.get(choice, LOCAL_LLM_MODELS["1.5b"])
+    info = LOCAL_LLM_MODELS[llm_choice(choice)]
     path = os.path.join(LOCAL_LLM_DIR, info["file"])
     if os.path.exists(path):
         return path
@@ -109,7 +125,7 @@ def download_models(cfg):
         log(f"[Download Error] Speech model could not be downloaded: {e}")
         ok = False
     if cfg.get("ai_mode", "local") == "local":
-        path = ensure_local_llm(cfg.get("local_model", "1.5b"))
+        path = ensure_local_llm(cfg.get("local_model", DEFAULT_LLM))
         if path:
             log(f"[Download] AI cleanup model is ready: {os.path.basename(path)}")
         else:
@@ -132,7 +148,7 @@ CLEANUP_SYSTEM_PROMPT = """You clean up dictated text. The user message is alway
 - Remove filler words (like, you know, I mean, altså, du ved, also, en fait) and stutters ("we need to, we need to").
 - When the speaker corrects themselves with "no wait", "sorry", "nej vent", "nein warte" or "non attends", delete the words they took back and the cue itself, and keep the correction: "on Tuesday, no wait, Wednesday" becomes "on Wednesday", "fifty, sorry, sixty boxes" becomes "sixty boxes".
 - Keep every line break. "New line" (ny linje, neue Zeile, à la ligne) starts a new line. "Bullet point", or a sentence starting with "Punkt" or "Puce", is a list item: start it on a new line with "- ".
-- Fix punctuation and capitalization.
+- Fix punctuation and capitalization. A question ends with a question mark.
 - Output only the cleaned text."""
 
 # Inputs look like what the LLM gets: filler sounds already removed and spoken
@@ -163,22 +179,58 @@ MEETING_TURN_NOTE = ("The next transcript is one turn from a recorded meeting, n
 LANGUAGE_NOTES = {"da": "Write in Danish.", "de": "Write in German.", "fr": "Write in French."}
 
 
-def build_cleanup_prompt(text, lang, dict_hint="", meeting=False):
-    """The ChatML prompt for one cleanup call: the fixed prefix, then one
-    note (meeting turn, dictionary hint, language) and the transcript."""
-    parts = [f"<|im_start|>system\n{CLEANUP_SYSTEM_PROMPT}<|im_end|>\n"]
+def chat_stop(fmt):
+    """The end-of-turn marker generation stops at, per chat format."""
+    return {"gemma": ["<end_of_turn>"], "gemma4": ["<turn|>"]}.get(fmt, ["<|im_end|>"])
+
+
+def render_chat(messages, fmt="chatml"):
+    """The prompt for [(role, text)] (system, user, assistant), ending with an
+    open assistant turn, as the model's own chat template writes it.
+    chatml: Qwen 2.5. qwen3: ChatML, plus the empty think block that the
+    Qwen3 / Qwen3.5 templates write for enable_thinking=False (without it the
+    model reasons at length first). gemma: Gemma 3, no system role, so system
+    text opens the next user turn, as its template does. gemma4: Gemma 4's
+    own turn markers, with a system role."""
+    out = []
+    if fmt == "gemma4":
+        for role, text in messages:
+            out.append(f"<|turn>{'model' if role == 'assistant' else role}\n{text}<turn|>\n")
+        out.append("<|turn>model\n")
+    elif fmt == "gemma":
+        pending = []
+        for role, text in messages:
+            if role == "system":
+                pending.append(text)
+                continue
+            if role == "user" and pending:
+                text, pending = "\n\n".join(pending + [text]), []
+            out.append(f"<start_of_turn>{'user' if role == 'user' else 'model'}\n{text.strip()}<end_of_turn>\n")
+        out.append("<start_of_turn>model\n")
+    else:
+        for role, text in messages:
+            out.append(f"<|im_start|>{role}\n{text}<|im_end|>\n")
+        out.append("<|im_start|>assistant\n" + ("<think>\n\n</think>\n\n" if fmt == "qwen3" else ""))
+    return "".join(out)
+
+
+def build_cleanup_prompt(text, lang, dict_hint="", meeting=False, fmt="chatml"):
+    """The prompt for one cleanup call: the fixed prefix, then one note
+    (meeting turn, dictionary hint, language) and the transcript."""
+    messages = [("system", CLEANUP_SYSTEM_PROMPT)]
     for said, cleaned in CLEANUP_EXAMPLES:
-        parts.append(f"<|im_start|>user\n{said}<|im_end|>\n<|im_start|>assistant\n{cleaned}<|im_end|>\n")
+        messages += [("user", said), ("assistant", cleaned)]
     notes = [MEETING_TURN_NOTE] if meeting else []
     if dict_hint and dict_hint.strip():
-        # Dictionary words are the user's data: no line breaks or ChatML tags.
-        notes.append(" ".join(dict_hint.replace("<|", "<").split()))
+        # Dictionary words are the user's data: no line breaks or chat tags.
+        hint = dict_hint.replace("<|", "<").replace("<start_of_turn>", "").replace("<end_of_turn>", "").replace("<|turn>", "").replace("<turn|>", "")
+        notes.append(" ".join(hint.split()))
     if lang in LANGUAGE_NOTES:
         notes.append(LANGUAGE_NOTES[lang])
     if notes:
-        parts.append(f"<|im_start|>system\n{' '.join(notes)}<|im_end|>\n")
-    parts.append(f"<|im_start|>user\n{text}<|im_end|>\n<|im_start|>assistant\n")
-    return "".join(parts)
+        messages.append(("system", " ".join(notes)))
+    messages.append(("user", text))
+    return render_chat(messages, fmt)
 
 
 class EnginesMixin:
@@ -197,15 +249,16 @@ class EnginesMixin:
         if self.ai_mode not in ("local", "off"):
             # Older configs may still say "gemini": cloud mode was removed.
             self.ai_mode = "local"
-        self.local_model_choice = self.config.get("local_model", "1.5b")
+        self.local_model_choice = llm_choice(self.config.get("local_model", DEFAULT_LLM))
         self.local_llm = None
+        self.llm_format = LOCAL_LLM_MODELS[self.local_model_choice].get("format", "chatml")
 
         if self.ai_mode == "off":
             log("[AI] AI Formatting is turned OFF (Raw Whisper transcription).")
             return
 
         if self.ai_mode == "local":
-            model_info = LOCAL_LLM_MODELS.get(self.local_model_choice, LOCAL_LLM_MODELS["1.5b"])
+            model_info = LOCAL_LLM_MODELS[self.local_model_choice]
             model_path = ensure_local_llm(self.local_model_choice)
             if not model_path:
                 log(f"[AI Warning] Local model '{model_info['file']}' is not available in {LOCAL_LLM_DIR}.")
@@ -242,9 +295,12 @@ class EnginesMixin:
                 self.local_llm = None
 
     def load_llm(self, n_ctx):
-        """A separate Qwen instance with a bigger context, for meeting summaries.
-        The GGUF is memory-mapped, so its weights are shared with the dictation
-        instance; only the extra KV cache costs RAM. Returns None when AI is off."""
+        """A separate LLM instance with a bigger context, for meeting summaries.
+        It does NOT share weights with the dictation instance: llama.cpp
+        repacks them for the CPU into memory of its own, so while a summary
+        runs RAM use about doubles (Gemma 4 E2B: 2.5 -> 5 GB, Qwen3 1.7B:
+        1.7 -> 4 GB). It is freed when the summary is done. Returns None when
+        AI is off."""
         if self.ai_mode == "off":
             return None
         path = ensure_local_llm(self.local_model_choice)
@@ -590,7 +646,8 @@ class EnginesMixin:
         return out
 
     def _format_chunk_local(self, text, lang, max_tokens=None, quiet=False, dict_hint="", meeting=False):
-        prompt = build_cleanup_prompt(text, lang, dict_hint, meeting)
+        fmt = getattr(self, "llm_format", "chatml")
+        prompt = build_cleanup_prompt(text, lang, dict_hint, meeting, fmt)
         try:
             t0 = time.time()
             if max_tokens is None:
@@ -599,8 +656,9 @@ class EnginesMixin:
                 n_in = len(self.local_llm.tokenize(text.encode("utf-8"), add_bos=False))
                 n_prompt = len(self.local_llm.tokenize(prompt.encode("utf-8"), add_bos=False))
                 max_tokens = max(16, min(int(n_in * 1.5) + 32, self.llm_ctx - n_prompt - 8))
-            res = self.local_llm(prompt, max_tokens=max_tokens, temperature=0.1, stop=["<|im_end|>"])
-            cleaned = res["choices"][0]["text"].strip()
+            res = self.local_llm(prompt, max_tokens=max_tokens, temperature=0.1, stop=chat_stop(fmt))
+            # rstrip per line: Qwen3 writes Markdown line breaks ("  \n").
+            cleaned = "\n".join(line.rstrip() for line in res["choices"][0]["text"].strip().split("\n"))
             dur = time.time() - t0
             if cleaned:
                 # Strip conversational model prefixes if any slipped through
@@ -618,6 +676,7 @@ class EnginesMixin:
                         log(f"[AI Warning] The AI changed the meaning, not just the form "
                             f"(\"{cleaned}\"). Kept the transcript as spoken.")
                     return speak_text.light_cleanup(text)
+                cleaned = speak_text.keep_question_mark(text, cleaned)
 
                 if not quiet:
                     n_out = res.get("usage", {}).get("completion_tokens", 0)

@@ -38,6 +38,7 @@ from ctypes import wintypes
 
 import numpy as np
 
+import speak_engines
 import speak_text
 
 _kernel32 = ctypes.WinDLL("kernel32")
@@ -76,7 +77,7 @@ ECHO_CORRELATION = 0.3          # above this, the call is audible in the mic (no
 ENROLL_SECONDS = 30
 ENROLL_MIN_SPEECH = 12          # seconds of actual speech needed for a reliable profile
 MAX_PAUSE_IN_TURN = 5.0         # a longer pause starts a new paragraph for the same speaker
-SUMMARY_CTX = 8192              # Qwen 2.5 supports 32k; 8k keeps RAM use near 250 MB extra
+SUMMARY_CTX = 8192              # both cleanup models support 32k; the KV cache for 8k is small next to the weights
 SUMMARY_CHUNK_TOKENS = 4500
 
 ENROLL_TEXT = (
@@ -1706,7 +1707,7 @@ class MeetingManager:
 
     def _summarize(self, turns):
         """Summary, decisions and action items (see the Minutes section above),
-        on an 8k-context Qwen instance of its own: the dictation instance keeps
+        on an 8k-context LLM instance of its own: the dictation instance keeps
         its 2k context and stays free for dictation."""
         llm = self.app.load_llm(SUMMARY_CTX)
         if llm is None:
@@ -1717,9 +1718,9 @@ class MeetingManager:
         language = LANGUAGE_NAMES.get(max(counts, key=counts.get), "English")
 
         def ask(system, user, max_tokens):
-            prompt = (f"<|im_start|>system\n{system}<|im_end|>\n"
-                      f"<|im_start|>user\n{user}<|im_end|>\n<|im_start|>assistant\n")
-            res = llm(prompt, max_tokens=max_tokens, temperature=0.1, stop=["<|im_end|>"])
+            fmt = getattr(self.app, "llm_format", "chatml")
+            prompt = speak_engines.render_chat([("system", system), ("user", user)], fmt)
+            res = llm(prompt, max_tokens=max_tokens, temperature=0.1, stop=speak_engines.chat_stop(fmt))
             return res["choices"][0]["text"].strip()
 
         def tokens(text):

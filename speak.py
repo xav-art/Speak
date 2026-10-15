@@ -4,7 +4,7 @@ Author: xav-art (MIT License)
 Features:
 - 100% Offline & Private: Audio and text never leave your computer.
 - Local Speech-to-Text via faster-whisper (CTranslate2 int8 on CPU).
-- Local AI Post-Processing via Qwen 2.5 (cleans filler words, handles punctuation, formats bullet points).
+- Local AI Post-Processing via Gemma 4 E2B or Qwen3 1.7B (cleans filler words, handles punctuation, formats bullet points).
 - Fully Self-Contained: All models and configuration live within the Speak directory.
 - Zero Admin Rights Required: Runs entirely in Windows user-space without firewall alerts.
 - Dedicated Hotkey Support: Tap '<' (or '>', '<>', F8, Pause, etc.) to start/stop dictating.
@@ -112,7 +112,7 @@ def load_config(path=None):
         "model": "base",
         "language": None,
         "ai_mode": "local",
-        "local_model": "1.5b",
+        "local_model": "gemma4-e2b",
         "paste_mode": "auto",
         "learn_hotkey": "CTRL+ALT+L",
         "whisper_threads": 4,
@@ -770,7 +770,7 @@ class SpeakApp(EnginesMixin, InsertionMixin):
 
     def get_ai_status_str(self):
         if self.ai_mode == "local" and self.local_llm:
-            m_info = LOCAL_LLM_MODELS.get(self.local_model_choice, LOCAL_LLM_MODELS["1.5b"])
+            m_info = LOCAL_LLM_MODELS[self.local_model_choice]
             return f"LOCAL ({m_info['name']} - 100% Offline, CPU)"
         elif self.ai_mode == "off":
             return "OFF (Raw Whisper verbatim transcription)"
@@ -934,20 +934,16 @@ class SpeakApp(EnginesMixin, InsertionMixin):
                     log("handles stutters, and formats spoken commands ('bullet point', 'new line')")
                     log("running 100% locally and privately on your CPU.")
                     log("\nOptions:")
-                    log("  1 - Local Qwen 2.5 1.5B (Recommended ~2s, best for Danish + English)")
-                    log("  2 - Local Qwen 2.5 0.5B (Ultra-fast ~1s, 468 MB)")
+                    for n, key in enumerate(LOCAL_LLM_MODELS, 1):
+                        info = LOCAL_LLM_MODELS[key]
+                        log(f"  {n} - Local {info['name']} ({info['size']})")
                     log("  3 - Turn AI Formatting OFF (Fastest: raw Whisper verbatim)")
                     log("  4 - Test Current AI formatting on sample dictation")
                     log("  Enter - Return to main menu")
                     sub = input("Choose option [1-4]: ").strip()
-                    if sub == "1":
+                    if sub in ("1", "2"):
                         self.config["ai_mode"] = "local"
-                        self.config["local_model"] = "1.5b"
-                        save_config(self.config)
-                        self.init_ai()
-                    elif sub == "2":
-                        self.config["ai_mode"] = "local"
-                        self.config["local_model"] = "0.5b"
+                        self.config["local_model"] = list(LOCAL_LLM_MODELS)[int(sub) - 1]
                         save_config(self.config)
                         self.init_ai()
                     elif sub == "3":

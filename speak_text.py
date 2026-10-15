@@ -200,6 +200,15 @@ def light_cleanup(text):
     return text
 
 
+def keep_question_mark(before, after):
+    """after, with the question mark back if the transcript ended in one and
+    the cleanup ended in a full stop instead. Whisper's "?" comes from the
+    intonation; Qwen3 1.7B turned it into "." in a fifth of the questions."""
+    if before.rstrip().endswith("?") and after.rstrip().endswith("."):
+        after = after.rstrip()[:-1] + "?"
+    return after
+
+
 # ---- Before and after the LLM ------------------------------------------------
 #
 # Code does what it can do reliably, so Qwen 1.5B does not have to: in testing
