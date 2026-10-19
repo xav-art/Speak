@@ -216,7 +216,7 @@ Settings are saved to `speak_config.json` when you change them in the app. You c
 | :--- | :--- | :--- |
 | `hotkey` | `<` | Dictation hotkey |
 | `learn_hotkey` | `CTRL+ALT+L` | Hotkey that learns a correction |
-| `model` | `base` | Whisper model: `tiny`, `base`, `small`, `medium`, `large-v3` (most accurate, slow on a laptop CPU) |
+| `model` | `base` | Whisper model: `tiny`, `base`, `small`, `medium`, `large-v3-turbo`, `large-v3` (most accurate, slow on a laptop CPU) |
 | `language` | `null` | `null` for auto-detect, or `en`, `da`, `de`, `fr` |
 | `language_check_short_phrases` | `true` | For phrases of up to 4 seconds that Whisper hears as another language than your last one, also try your last language, and keep it if Whisper is clearly more sure of it. `true` does this on `tiny` and `base` only (measured on `medium`, the check fixed nothing and cost 3.4 s), `"always"` on every model, `false` never |
 | `ai_mode` | `local` | `local` (AI cleanup) or `off` (raw Whisper) |
@@ -248,14 +248,15 @@ Settings are saved to `speak_config.json` when you change them in the app. You c
 
 ## Performance notes
 
-Measured on an Intel Core Ultra 7 265U with `faster-whisper-base` and Qwen 2.5 1.5B (the AI model before Gemma 4 E2B):
+Measured on an Intel Core Ultra 7 265U:
 
 | Optimization | Effect |
 | :--- | :--- |
 | Whisper keeps its timestamps | Without them Whisper often stopped after the first sentence that ended in a pause: of a 69-second dictation only 17 of 115 words came out, of a 21-second one 10 of 54. With them every word comes out, at the same speed |
 | Long dictations transcribed and cleaned while you speak | Whisper works on a fixed 30-second window, so a short dictation cannot be sped up this way (its last 3 seconds take 80 to 90% of the whole). A dictation longer than about 20 seconds is cut at a pause (or, if you do not pause, at a breath) and each piece is transcribed and cleaned while you go on speaking; after you stop, only the last piece is left. Pieces cut at a breath, or that start with a command or a correction (*"no wait"*, *"scratch that"*, *"new line"*), are cleaned together, so the result is the same as in one go |
-| One encoder pass for language detection and transcription | Whisper stage **40 to 60% faster** (faster-whisper otherwise encodes the same 30 s window twice) |
-| Fast path for short, clean phrases (8 words or fewer, no fillers, commands or numbers). A filler at the start is removed by Speak itself, and filler lists are per language ("er" is a filler in English, "is" in Danish) | Language model skipped. In the benchmark, all short phrases now skip it (was about half), and they are inserted about 40% faster |
+| One encoder pass for language detection and transcription | Whisper stage **40 to 60% faster** (faster-whisper otherwise encodes the same 30 s window twice). When VAD finds no speech (`content_frames <= 0`), the encoder is skipped outright (`5.8 s` to `0.02 s` on silent clips) |
+| Disk KV-cache persistence for fixed LLM prompt prefixes | The evaluated KV cache for the 754-token cleanup prompt prefix and the meeting minutes extraction prompt is saved to `models\llm\*.state` on first run and loaded from disk in ~0.03 s on subsequent runs. Startup LLM warm-up dropped from **24.1 s to 0.2 s (~120x faster)**, and meeting minutes extraction saves ~10.5 s of cold prompt evaluation per meeting |
+| Extended clean-text fast path and dirty-sentence filtering | Any dictation that is already clean after deterministic filler removal, stutter collapsing and spoken-command execution skips the LLM regardless of word count, and multi-sentence dictations send only the sentences containing disfluencies or corrections to the LLM. On `bench/run_bench.py`, fast-path coverage rose from **53% to 83%**, mean LLM time fell by **72% (`0.90 s` to `0.25 s`)**, and mean end-to-end latency fell by **31% (`2.31 s` to `1.59 s`)** with zero WER regression |
 | Clipboard restored on a timer after a paste | The next dictation no longer waits 0.8 s after every paste |
 | Short-phrase language check | A phrase of up to 4 s that Whisper hears as another language than your last one is decoded in both, greedily. Fixes short phrases such as *"Det er fint med mig"* that Whisper hears as German. Costs about 0.2 to 0.3 s on `base`, only when the languages disagree. Off by default on `small` and larger: measured on `medium`, it fixed nothing and cost 3.4 s |
 | Engines warmed up at startup | The first dictation is as fast as the rest |
@@ -263,10 +264,37 @@ Measured on an Intel Core Ultra 7 265U with `faster-whisper-base` and Qwen 2.5 1
 | Direct typing sends 32 characters per `SendInput` call | Insertion into terminals is about 20x faster |
 | One cleanup prompt for all four languages, with worked examples. Speak itself removes filler sounds and applies *new line*, *bullet point* and *scratch that* before the AI runs, and rejects any AI output that drops, adds or translates words | On a set of 39 dictations and meeting turns, word errors after cleanup fell from 17% to under 1%: the old per-language prompts dropped *"I think"*, *"please"* and introduction lines, and missed half the line breaks. Each AI call is also about 15% faster: the prompt stays cached when you switch language |
 | Meetings: batched Whisper, 4 chunks of up to 25 seconds at a time (`meeting_batch_size`; 4 and 8 measured the same speed, 4 needs less memory). A chunk where Whisper loops (*"the the the"*) is transcribed again the normal way | On a 10-minute synthetic call, Whisper took 116 to 124 s instead of 183 to 187 s with short turns, the same to 8% slower with 20 to 40-second monologues (sequential Whisper is already efficient on long turns), at the same accuracy. Each chunk is decoded once, so Whisper must not stop early: with 30-second chunks it dropped whole sentences (WER 6.4% to 8.5%, and 19% without timestamps), with 25 seconds it dropped nothing. 20 and 15-second chunks were as accurate but lost the speed, because every chunk costs a full 30-second window |
+| Meetings: fast per-speaker language detection and clause pruning | Detecting each speaker's language on 25 s of glued speech uses the already-loaded `base` model first (falling back to the meeting model if confidence `< 0.80`), cutting speaker language detection from **27.4 s to 5.2 s (5.2x faster)**. In minutes extraction, skipping bare 1-word agreements (*"Agreed."*) and requests already accepted by a promise on the next line, plus stopping JSON generation at `}`, cuts `_summarize` time by **43% (`73.3 s` to `42.0 s`)** with identical output |
 | Gemma 4 E2B as the AI model (October 2026), chosen with `bench/run_cleanup_bench.py` from Qwen 2.5 1.5B, Qwen3 1.7B, Qwen3.5 0.8B and 2B, and Gemma 3 1B | On 54 hard Danish and German transcripts (run-on sentences, lowercase nouns, corrections, stutters), word errors fell from 3.1% to 2.2% (Danish 3.2% to 0.6%) and capital, punctuation and sentence-break errors halved (46 to 20). Qwen 2.5 ignored *"nej vent"* and left run-on sentences; Qwen3 1.7B has the same word errors as Gemma but twice its punctuation errors. Cost: about 35% slower on a 120-word dictation, 0.4 s on a short one, and 2.5 GB instead of 1.9 GB of RAM. Qwen3.5 was 5 to 10 times slower: llama.cpp cannot reuse the cached prompt for its recurrent layers |
 | Long dictations cleaned in sentence-aligned chunks (at line breaks first, at commas, or in equal pieces of up to 160 words, when Whisper wrote no full stops; the AI may then start a new sentence at such a split) | No silent truncation after about 100 words |
 
-Tested and rejected (kept as opt-in config keys): prompt-lookup speculative decoding (`speculative_decoding`, 2.5x *slower* on CPU with llama-cpp-python 0.3.x), flash attention (no gain), and Whisper `hotwords` (makes multi-word names stutter). On hybrid P/E-core CPUs, more Whisper threads were consistently *slower*.
+Tested and rejected: prompt-lookup speculative decoding (`speculative_decoding`, 2.5x *slower* on CPU with llama-cpp-python 0.3.x), flash attention (no gain), Whisper `hotwords` (makes multi-word names stutter), shrinking Whisper's 3000-frame encoder window (breaks fixed positional embeddings and causes decoder looping), lowering Gemma 4 temperature from `0.1` to `0.0` (drops *"at"* on Danish stutters), lowering `n_threads_batch` below logical core count (`17.5 s` at 14 threads vs `25.6–28.9 s` at 6–10 threads), and VAD-compacting call audio before `sherpa-onnx` diarization (saved only 3.7 s on a 3.3-minute call while splitting 3 remote voices into 4 clusters). On hybrid P/E-core CPUs, more than 6 Whisper/LLM generation threads were consistently *slower*.
+
+### Whisper model comparison (CPU, `int8`)
+
+Measured on an Intel Core Ultra 7 265U (6 threads) across all 30 multilingual clips (`en`, `da`, `de`, `fr`) and 3 silence clips in `bench/corpus.json` with `ai_mode="off"` (pure Whisper STT):
+
+| Model | Disk size | Startup + warm-up | Median STT | Mean STT | Raw STT WER (all) | `en` WER | `da` WER | `de` WER | `fr` WER | Lang ID | Phantom |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **`base`** *(dictation default)* | 141 MB | **1.53 s** | **1.72 s** | **1.87 s** | 20.72% | 7.26% *(1.5 s)* | 44.44% *(2.6 s)* | 30.61% *(1.7 s)* | 6.00% *(1.4 s)* | 93.3% | 0 / 3 |
+| **`small`** *(meeting default)* | 464 MB | 6.02 s | 4.38 s | 4.56 s | 13.49% | **0.81%** *(4.4 s)* | 38.27% *(5.4 s)* | 10.20% *(3.7 s)* | 8.00% *(4.2 s)* | 90.0% | 0 / 3 |
+| **`medium`** | 1.43 GB | 15.79 s | **10.61 s** | **10.65 s** | **4.61%** | **0.81%** *(10.8 s)* | **8.64%** *(10.4 s)* | 8.16% *(10.2 s)* | **4.00%** *(11.6 s)* | **96.7%** | 0 / 3 |
+| **`large-v3-turbo`** | 1.51 GB | 23.59 s | 18.90 s | 18.89 s | 4.93% | **0.81%** *(18.0 s)* | 12.35% *(19.8 s)* | **4.08%** *(19.6 s)* | **4.00%** *(18.6 s)* | 93.3% | 0 / 3 |
+
+| Utterance category (`bench/corpus.json`) | `base` | `small` | `medium` | `large-v3-turbo` |
+| :--- | :---: | :---: | :---: | :---: |
+| **Long dictations (`kind:long`)** | 16.78% | 11.89% | 3.50% | **2.10%** |
+| **Proper names (`kind:names`)** | 20.00% | 10.00% | 10.00% | **0.00%** |
+| **Spoken commands (`kind:command`)** | 26.47% | 5.88% | **0.00%** | **0.00%** |
+| **Disfluencies (`kind:filler`)** | 21.95% | **9.76%** | 12.20% | **9.76%** |
+| **Short phrases (`kind:short`)** | 25.00% | 28.57% | **3.57%** | 10.71% |
+
+**Why `large-v3-turbo` is slower than `medium` on CPU (`18.9 s` vs `10.7 s`):**
+- `medium` uses **24 encoder layers** (`d_model = 1024`) and **24 decoder layers**.
+- `large-v3-turbo` keeps the **full 32-layer `large-v3` encoder** (`d_model = 1280`, ~2x the encoder compute of `medium`) and shrinks only the **decoder from 32 layers to 4 layers**.
+- On a GPU, the 30-second encoder pass runs in parallel in `<30 ms`, so token-by-token decoding dominates and `large-v3-turbo` is faster than `medium`. On a CPU, Whisper must still run the full 30-second (3,000-frame) encoder pass first: for short 3–8 s dictations (~15 tokens), ~85–90% of CPU time is spent in the encoder (`~17.5 s` on `large-v3-turbo` vs `~8.0 s` on `medium`).
+- Compared to full `large-v3` (~30–35 s per clip on CPU), `large-v3-turbo` is **~1.7x faster** and achieves the best accuracy on **German (`4.08%` WER)**, **long dictations (`2.10%` WER)** and **proper nouns (`0.00%` WER)**, while **`medium`** remains the CPU sweet spot for **Danish (`8.64%` WER at `10.4 s`)** and **`base`/`small`** for fast everyday English/French dictation.
+
 
 ## Project structure
 
