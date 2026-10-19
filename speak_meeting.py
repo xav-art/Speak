@@ -1131,7 +1131,7 @@ class MeetingManager:
 
     def ensure_whisper_model(self):
         size = self.config.get("meeting_model", "small")
-        if os.path.exists(os.path.join(self.models_dir, f"models--Systran--faster-whisper-{size}")):
+        if os.path.exists(os.path.join(self.models_dir, speak_engines.whisper_model_dir(size))):
             return True
         self.log(f"[Meeting] First-time setup: downloading speech model 'faster-whisper-{size}' for meetings (one time only)...")
         try:
@@ -1447,31 +1447,47 @@ class MeetingManager:
         turns of 3 s or more detected one by one. Speakers with under 2 s of
         speech take the meeting's main language."""
         locked = self.app.language if self.app.language in self.allowed else None
+        fast_model, own_fast = getattr(self.app, "whisper_model", None), False
+        if (not locked and fast_model is None and getattr(self, "config", {}).get("meeting_model", "small") != "base"
+                and hasattr(self, "models_dir") and hasattr(self.app, "_load_whisper")
+                and os.path.exists(os.path.join(self.models_dir, speak_engines.whisper_model_dir("base")))):
+            try:
+                fast_model, own_fast = self.app._load_whisper("base"), True
+            except Exception:
+                fast_model = None
+        fast_model = fast_model or model
         langs, pending, weight = {}, [], {}
-        for key, segs in segments_by_key.items():
-            if locked:
-                langs.update({(key, s[0]): locked for s in segs})
-                continue
-            audio = audio_by_stream[key[0]]
-            clip = lambda s: audio[int(s[0] * SAMPLE_RATE):int(s[1] * SAMPLE_RATE)]
-            total = sum(s[1] - s[0] for s in segs)
-            if total < 2.0:
-                pending.append(key)
-                continue
-            parts, used = [], 0.0
-            for s in sorted(segs, key=lambda s: s[1] - s[0], reverse=True):
-                parts.append(clip(s))
-                used += s[1] - s[0]
-                if used >= 25:
-                    break
-            lang, prob = self._detect(model, np.concatenate(parts)[:28 * SAMPLE_RATE])
-            lang = lang or fallback
-            weight[lang] = weight.get(lang, 0.0) + total
-            for s in segs:
-                own = lang
-                if prob < 0.6 and s[1] - s[0] >= 3.0:
-                    own = self._detect(model, clip(s))[0] or lang
-                langs[(key, s[0])] = own
+        try:
+            for key, segs in segments_by_key.items():
+                if locked:
+                    langs.update({(key, s[0]): locked for s in segs})
+                    continue
+                audio = audio_by_stream[key[0]]
+                clip = lambda s: audio[int(s[0] * SAMPLE_RATE):int(s[1] * SAMPLE_RATE)]
+                total = sum(s[1] - s[0] for s in segs)
+                if total < 2.0:
+                    pending.append(key)
+                    continue
+                parts, used = [], 0.0
+                for s in sorted(segs, key=lambda s: s[1] - s[0], reverse=True):
+                    parts.append(clip(s))
+                    used += s[1] - s[0]
+                    if used >= 25:
+                        break
+                sample = np.concatenate(parts)[:28 * SAMPLE_RATE]
+                lang, prob = self._detect(fast_model, sample)
+                if prob < 0.8 and fast_model is not model:
+                    lang, prob = self._detect(model, sample)
+                lang = lang or fallback
+                weight[lang] = weight.get(lang, 0.0) + total
+                for s in segs:
+                    own = lang
+                    if prob < 0.6 and s[1] - s[0] >= 3.0:
+                        own = self._detect(model, clip(s))[0] or lang
+                    langs[(key, s[0])] = own
+        finally:
+            if own_fast:
+                del fast_model
         main = max(weight, key=weight.get) if weight else (locked or fallback)
         for key in pending:
             langs.update({(key, s[0]): main for s in segments_by_key[key]})
@@ -1763,22 +1779,49 @@ class MeetingManager:
             counts[t["lang"]] = counts.get(t["lang"], 0) + len(t["text"].split())
         language = LANGUAGE_NAMES.get(max(counts, key=counts.get), "English")
 
-        def ask(system, user, max_tokens):
-            fmt = getattr(self.app, "llm_format", "chatml")
+        fmt = getattr(self.app, "llm_format", "chatml")
+
+        def ask(system, user, max_tokens, stop_brace=False):
             prompt = speak_engines.render_chat([("system", system), ("user", user)], fmt)
-            res = llm(prompt, max_tokens=max_tokens, temperature=0.1, stop=speak_engines.chat_stop(fmt))
-            return res["choices"][0]["text"].strip()
+            stop = speak_engines.chat_stop(fmt) + (["}"] if stop_brace else [])
+            res = llm(prompt, max_tokens=max_tokens, temperature=0.1, stop=stop)
+            txt = res["choices"][0]["text"].strip()
+            if stop_brace and "{" in txt and not txt.endswith("}"):
+                txt += "}"
+            return txt
 
         def tokens(text):
             return len(llm.tokenize(text.encode("utf-8"), add_bos=False))
 
         try:
-            # 1. Tasks and decisions, one clause at a time.
-            clauses = minute_clauses(turns)
-            items = []
-            for n, (i, kind, clause) in enumerate(clauses):
-                print(f"\r[Meeting] Finding tasks and decisions: {n + 1}/{len(clauses)}", end="", flush=True)
-                answer = parse_clause_answer(ask(MINUTES_EXTRACT_PROMPT, context_for(turns, i, clause), 120))
+            # 1. Tasks and decisions, one clause at a time. Bare one-word
+            #    agreements ("Agreed.") and requests accepted by a promise on
+            #    the next line are skipped before calling the LLM because
+            #    render_minutes drops both anyway.
+            clauses = [c for c in minute_clauses(turns) if len(c[2].split()) >= 2]
+            if clauses:
+                choice = getattr(self.app, "local_model_choice", speak_engines.DEFAULT_LLM)
+                model_file = speak_engines.LOCAL_LLM_MODELS.get(choice, {}).get("file", "model")
+                prefix = speak_engines.render_chat([("system", MINUTES_EXTRACT_PROMPT), ("user", "__SPLIT__")], fmt).split("__SPLIT__")[0]
+                speak_engines.warm_up_prompt_prefix(llm, prefix, model_file, SUMMARY_CTX)
+            items, promised_lines, deferred, done = [], set(), [], 0
+            for i, kind, clause in clauses:
+                if kind == "request" and agreed_by_next(turns, i) and any(ci == i + 1 and ck == "promise" for ci, ck, _ in clauses):
+                    deferred.append((i, kind, clause))
+                    continue
+                done += 1
+                print(f"\r[Meeting] Finding tasks and decisions: {done}/{len(clauses)}", end="", flush=True)
+                answer = parse_clause_answer(ask(MINUTES_EXTRACT_PROMPT, context_for(turns, i, clause), 120, stop_brace=True))
+                if answer:
+                    items.append({"line": i, "kind": kind, "clause": clause, **answer})
+                    if kind == "promise" and answer.get("keep"):
+                        promised_lines.add(i)
+            for i, kind, clause in deferred:
+                if i + 1 in promised_lines:
+                    continue
+                done += 1
+                print(f"\r[Meeting] Finding tasks and decisions: {done}/{len(clauses)}", end="", flush=True)
+                answer = parse_clause_answer(ask(MINUTES_EXTRACT_PROMPT, context_for(turns, i, clause), 120, stop_brace=True))
                 if answer:
                     items.append({"line": i, "kind": kind, "clause": clause, **answer})
             if clauses:

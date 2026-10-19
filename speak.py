@@ -59,7 +59,7 @@ from speak_base import ALLOWED_LANGUAGES, LOCAL_LLM_DIR, MODELS_DIR, _kernel32, 
 from speak_engines import (CLEANUP_EXAMPLES, CLEANUP_SYSTEM_PROMPT, LANGUAGE_NOTES, LOCAL_LLM_MODELS,
                            MEETING_TURN_NOTE, WHISPER_MODELS, EnginesMixin, LiveTranscriber, SilenceWatcher,
                            build_cleanup_prompt, download_file, download_models, ensure_local_llm,
-                           get_dir_size_str)
+                           get_dir_size_str, whisper_model_dir)
 from speak_tray import TrayIcon, show_console
 from speak_insert import (EXTENDED_KEYS, INPUT, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY,
                           KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, PM_REMOVE, VK_C, VK_CONTROL, VK_INSERT, VK_LWIN,
@@ -249,7 +249,7 @@ class SpeakApp(EnginesMixin, InsertionMixin):
         os.makedirs(MODELS_DIR, exist_ok=True)
         os.makedirs(LOCAL_LLM_DIR, exist_ok=True)
 
-        self.model_dir_name = f"models--Systran--faster-whisper-{self.model_size}"
+        self.model_dir_name = whisper_model_dir(self.model_size)
         self.model_storage_path = os.path.join(MODELS_DIR, self.model_dir_name)
 
         # Initialize AI Formatting (Local or Cloud)
@@ -1023,10 +1023,10 @@ class SpeakApp(EnginesMixin, InsertionMixin):
 
                 elif cmd in ("m", "model"):
                     log("\n--- CHANGE WHISPER MODEL ---")
-                    log("Options: medium (high accuracy, recommended), base (faster), small, tiny, large-v3 (most accurate, slow on CPU)")
-                    new_m = input("Enter model size [tiny/base/small/medium/large-v3]: ").strip().lower()
+                    log("Options: medium (high accuracy, recommended), base (faster), small, tiny, large-v3-turbo, large-v3 (most accurate, slow on CPU)")
+                    new_m = input("Enter model size [tiny/base/small/medium/large-v3-turbo/large-v3]: ").strip().lower()
                     if new_m in WHISPER_MODELS:
-                        target_dir = os.path.join(MODELS_DIR, f"models--Systran--faster-whisper-{new_m}")
+                        target_dir = os.path.join(MODELS_DIR, whisper_model_dir(new_m))
                         if not os.path.exists(target_dir):
                             confirm = input(f"Model '{new_m}' is not bundled locally. Download now via Hugging Face? (y/N): ").strip().lower()
                             if confirm != "y":
@@ -1036,7 +1036,7 @@ class SpeakApp(EnginesMixin, InsertionMixin):
                         with self.engine_lock:
                             self.model_size = new_m
                             self.config["model"] = new_m
-                            self.model_dir_name = f"models--Systran--faster-whisper-{self.model_size}"
+                            self.model_dir_name = whisper_model_dir(self.model_size)
                             self.model_storage_path = os.path.join(MODELS_DIR, self.model_dir_name)
                             save_config(self.config)
                             log(f"Reloading Whisper with '{new_m}' model from self-contained directory...")

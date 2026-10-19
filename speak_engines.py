@@ -133,7 +133,20 @@ def download_models(cfg):
     return ok
 
 # Whisper sizes offered by the m menu and --model.
-WHISPER_MODELS = ("tiny", "base", "small", "medium", "large-v3")
+WHISPER_MODELS = ("tiny", "base", "small", "medium", "large-v3-turbo", "large-v3")
+
+
+def whisper_model_dir(size):
+    """Hugging Face cache folder name for a faster-whisper model size."""
+    try:
+        from faster_whisper.utils import _MODELS
+        repo = _MODELS.get(size)
+        if repo and "/" in repo:
+            return "models--" + repo.replace("/", "--")
+    except Exception:
+        pass
+    return f"models--Systran--faster-whisper-{size}"
+
 
 # ---- Cleanup prompt -------------------------------------------------------------
 # One prompt for every language, for dictation and meeting turns alike, built
@@ -232,6 +245,38 @@ def _cleanup_prefix(fmt):
         open_turn = render_chat([], fmt)
         _CLEANUP_PREFIX[key] = full[:-len(open_turn)] if open_turn and full.endswith(open_turn) else full
     return _CLEANUP_PREFIX[key]
+
+
+def warm_up_prompt_prefix(llm, prefix, model_file, ctx_size):
+    """Loads the evaluated KV cache for `prefix` from disk (~0.03s), or
+    evaluates and saves it once on the first run."""
+    if not hasattr(llm, "_ctx") or not hasattr(llm, "_model") or not prefix:
+        return
+    try:
+        import ctypes
+        import hashlib
+        import llama_cpp
+        toks = llm.tokenize(prefix.encode("utf-8"), add_bos=llm._model.add_bos_token(), special=True)
+        if not toks:
+            return
+        digest = hashlib.sha256(prefix.encode("utf-8")).hexdigest()[:12]
+        state_path = os.path.join(LOCAL_LLM_DIR, f"{model_file}.{ctx_size}.{digest}.state")
+        if os.path.exists(state_path):
+            n_out = ctypes.c_size_t(0)
+            out_arr = (llama_cpp.llama_token * ctx_size)()
+            if llama_cpp.llama_state_load_file(llm._ctx.ctx, state_path.encode("utf-8"), out_arr, ctx_size, ctypes.byref(n_out)):
+                llm.input_ids[:n_out.value] = list(out_arr[:n_out.value])
+                llm.n_tokens = n_out.value
+                return
+        llm.reset()
+        llm.eval(toks)
+        arr = (llama_cpp.llama_token * len(toks))(*toks)
+        tmp = state_path + ".tmp"
+        if llama_cpp.llama_state_save_file(llm._ctx.ctx, tmp.encode("utf-8"), arr, len(toks)):
+            os.replace(tmp, state_path)
+    except Exception:
+        pass
+
 
 
 def build_cleanup_prompt(text, lang, dict_hint="", meeting=False, fmt="chatml"):
@@ -420,37 +465,12 @@ class EnginesMixin:
         disk (~0.03s), or evaluates and saves it once on the first run so
         subsequent startups skip the ~18-24s prompt evaluation."""
         llm = getattr(self, "local_llm", None)
-        if not hasattr(llm, "_ctx") or not hasattr(llm, "_model"):
-            return
-        try:
-            import ctypes
-            import hashlib
-            import llama_cpp
-            fmt = getattr(self, "llm_format", "chatml")
-            prefix = _cleanup_prefix(fmt)
-            toks = llm.tokenize(prefix.encode("utf-8"), add_bos=llm._model.add_bos_token(), special=True)
-            if not toks:
-                return
-            digest = hashlib.sha256(prefix.encode("utf-8")).hexdigest()[:12]
-            choice = getattr(self, "local_model_choice", DEFAULT_LLM)
-            model_file = LOCAL_LLM_MODELS.get(choice, {}).get("file", "model")
-            ctx_size = getattr(self, "llm_ctx", 2048)
-            state_path = os.path.join(LOCAL_LLM_DIR, f"{model_file}.{ctx_size}.{digest}.state")
-            if os.path.exists(state_path):
-                n_out = ctypes.c_size_t(0)
-                out_arr = (llama_cpp.llama_token * ctx_size)()
-                if llama_cpp.llama_state_load_file(llm._ctx.ctx, state_path.encode("utf-8"), out_arr, ctx_size, ctypes.byref(n_out)):
-                    llm.input_ids[:n_out.value] = list(out_arr[:n_out.value])
-                    llm.n_tokens = n_out.value
-                    return
-            llm.reset()
-            llm.eval(toks)
-            arr = (llama_cpp.llama_token * len(toks))(*toks)
-            tmp = state_path + ".tmp"
-            if llama_cpp.llama_state_save_file(llm._ctx.ctx, tmp.encode("utf-8"), arr, len(toks)):
-                os.replace(tmp, state_path)
-        except Exception:
-            pass
+        fmt = getattr(self, "llm_format", "chatml")
+        choice = getattr(self, "local_model_choice", DEFAULT_LLM)
+        model_file = LOCAL_LLM_MODELS.get(choice, {}).get("file", "model")
+        ctx_size = getattr(self, "llm_ctx", 2048)
+        warm_up_prompt_prefix(llm, _cleanup_prefix(fmt), model_file, ctx_size)
+
 
     def warm_up(self):
         """First inference after loading is 2-3x slower (page-in, thread spin-up).

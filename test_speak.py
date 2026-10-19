@@ -3067,7 +3067,75 @@ class TestSpeedOptimizations(unittest.TestCase):
         import speak_dictionary as sd_mod
         self.assertIs(sd_mod._word_pattern("Power BI"), sd_mod._word_pattern("Power BI"))
 
+    def test_whisper_model_dir_supports_systran_and_turbo(self):
+        self.assertEqual(speak_engines.whisper_model_dir("base"), "models--Systran--faster-whisper-base")
+        self.assertEqual(speak_engines.whisper_model_dir("large-v3-turbo"),
+                         "models--mobiuslabsgmbh--faster-whisper-large-v3-turbo")
+
+    def test_speaker_languages_uses_fast_model_and_falls_back_when_unsure(self):
+        from types import SimpleNamespace
+        calls = []
+
+        class FakeWhisper:
+            def __init__(self, tag, lang, prob):
+                self.tag, self.lang, self.prob = tag, lang, prob
+
+            def detect_language(self, audio=None):
+                calls.append(self.tag)
+                return self.lang, self.prob, [(self.lang, self.prob)]
+
+        mgr = sm.MeetingManager.__new__(sm.MeetingManager)
+        mgr.allowed = {"en", "da", "de", "fr"}
+        mgr.config = {"meeting_model": "small"}
+        mgr.app = SimpleNamespace(language=None, whisper_model=FakeWhisper("base", "da", 0.95))
+        audio = {"system": np.zeros(5 * sm.SAMPLE_RATE, np.float32)}
+        segs = {("system", 0): [(0.0, 4.0, 0)]}
+        langs = mgr._speaker_languages(FakeWhisper("small", "da", 0.99), audio, segs, "en")
+        self.assertEqual(langs, {(("system", 0), 0.0): "da"})
+        self.assertEqual(calls, ["base"])   # confident on base -> small encoder not called
+
+        calls.clear()
+        mgr.app.whisper_model = FakeWhisper("base", "en", 0.55)
+        langs = mgr._speaker_languages(FakeWhisper("small", "da", 0.92), audio, segs, "en")
+        self.assertEqual(langs, {(("system", 0), 0.0): "da"})
+        self.assertEqual(calls, ["base", "small"])   # unsure on base -> verified with small
+
+    def test_summarize_skips_bare_one_word_and_accepted_request_clauses(self):
+        from types import SimpleNamespace
+        asked = []
+
+        class FakeLLM:
+            def tokenize(self, b, add_bos=False):
+                return list(range(max(1, len(b) // 4)))
+
+            def __call__(self, prompt, max_tokens=120, temperature=0.1, stop=None):
+                asked.append(prompt)
+                if "Summarize this part" in prompt:
+                    return {"choices": [{"text": "The team agreed on next steps."}]}
+                if "call them after this meeting" in prompt:
+                    return {"choices": [{"text": '{"keep": true, "text": "Call the studio", "due": "today"'}]}
+                return {"choices": [{"text": '{"keep": true, "text": "Meet on Thursday", "due": "Thursday"'}]}
+
+            def close(self):
+                pass
+
+        mgr = sm.MeetingManager.__new__(sm.MeetingManager)
+        mgr.log = lambda *a: None
+        mgr.app = SimpleNamespace(load_llm=lambda ctx: FakeLLM(), llm_format="chatml", local_model_choice="gemma4-e2b")
+        turns = [
+            {"label": "Me", "start": 0, "text": "Zira, can you chase the studio today?", "lang": "en"},
+            {"label": "Person 1", "start": 5, "text": "Yes, I will call them after this meeting.", "lang": "en"},
+            {"label": "Me", "start": 10, "text": "Agreed. Let us meet on Thursday.", "lang": "en"},
+        ]
+        md = mgr._summarize(turns)
+        # 4 raw clauses (request on 0, promise on 1, bare "Agreed." on 2, decision on 2),
+        # but only 2 clause calls + 1 summary call are made to the LLM.
+        self.assertEqual(len(asked), 3)
+        self.assertIn("Call the studio", md)
+        self.assertIn("Meet on Thursday", md)
+
 
 if __name__ == "__main__":
     unittest.main()
+
 
