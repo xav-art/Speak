@@ -218,12 +218,25 @@ def render_chat(messages, fmt="chatml"):
     return "".join(out)
 
 
+_CLEANUP_PREFIX = {}
+
+
+def _cleanup_prefix(fmt):
+    """The fixed system prompt and worked examples, rendered once per format."""
+    key = (fmt, CLEANUP_SYSTEM_PROMPT, CLEANUP_EXAMPLES)
+    if key not in _CLEANUP_PREFIX:
+        messages = [("system", CLEANUP_SYSTEM_PROMPT)]
+        for said, cleaned in CLEANUP_EXAMPLES:
+            messages += [("user", said), ("assistant", cleaned)]
+        full = render_chat(messages, fmt)
+        open_turn = render_chat([], fmt)
+        _CLEANUP_PREFIX[key] = full[:-len(open_turn)] if open_turn and full.endswith(open_turn) else full
+    return _CLEANUP_PREFIX[key]
+
+
 def build_cleanup_prompt(text, lang, dict_hint="", meeting=False, fmt="chatml"):
     """The prompt for one cleanup call: the fixed prefix, then one note
     (meeting turn, dictionary hint, language) and the transcript."""
-    messages = [("system", CLEANUP_SYSTEM_PROMPT)]
-    for said, cleaned in CLEANUP_EXAMPLES:
-        messages += [("user", said), ("assistant", cleaned)]
     notes = [MEETING_TURN_NOTE] if meeting else []
     if dict_hint and dict_hint.strip():
         # Dictionary words are the user's data: no line breaks or chat tags.
@@ -231,10 +244,8 @@ def build_cleanup_prompt(text, lang, dict_hint="", meeting=False, fmt="chatml"):
         notes.append(" ".join(hint.split()))
     if lang in LANGUAGE_NOTES:
         notes.append(LANGUAGE_NOTES[lang])
-    if notes:
-        messages.append(("system", " ".join(notes)))
-    messages.append(("user", text))
-    return render_chat(messages, fmt)
+    tail = ([("system", " ".join(notes))] if notes else []) + [("user", text)]
+    return _cleanup_prefix(fmt) + render_chat(tail, fmt)
 
 
 class EnginesMixin:
@@ -388,6 +399,8 @@ class EnginesMixin:
                 return original_detect(audio=audio, features=features, **kwargs)
             try:
                 content_frames = features.shape[-1] - 1
+                if content_frames <= 0:
+                    return "en", 0.0, [("en", 0.0)]
                 segment = pad_or_trim(features[..., :min(nb_max_frames, content_frames)])
                 results = real_model.detect_language(cached_encode(segment))[0]
                 probs = [(allowed_tokens[tok], p) for tok, p in results if tok in allowed_tokens]
@@ -402,6 +415,43 @@ class EnginesMixin:
         model.detect_language = fast_detect_language
         model._speak_encode_cache = cache
 
+    def _warm_up_prefix(self):
+        """Loads the evaluated KV cache for the fixed cleanup prompt prefix from
+        disk (~0.03s), or evaluates and saves it once on the first run so
+        subsequent startups skip the ~18-24s prompt evaluation."""
+        llm = getattr(self, "local_llm", None)
+        if not hasattr(llm, "_ctx") or not hasattr(llm, "_model"):
+            return
+        try:
+            import ctypes
+            import hashlib
+            import llama_cpp
+            fmt = getattr(self, "llm_format", "chatml")
+            prefix = _cleanup_prefix(fmt)
+            toks = llm.tokenize(prefix.encode("utf-8"), add_bos=llm._model.add_bos_token(), special=True)
+            if not toks:
+                return
+            digest = hashlib.sha256(prefix.encode("utf-8")).hexdigest()[:12]
+            choice = getattr(self, "local_model_choice", DEFAULT_LLM)
+            model_file = LOCAL_LLM_MODELS.get(choice, {}).get("file", "model")
+            ctx_size = getattr(self, "llm_ctx", 2048)
+            state_path = os.path.join(LOCAL_LLM_DIR, f"{model_file}.{ctx_size}.{digest}.state")
+            if os.path.exists(state_path):
+                n_out = ctypes.c_size_t(0)
+                out_arr = (llama_cpp.llama_token * ctx_size)()
+                if llama_cpp.llama_state_load_file(llm._ctx.ctx, state_path.encode("utf-8"), out_arr, ctx_size, ctypes.byref(n_out)):
+                    llm.input_ids[:n_out.value] = list(out_arr[:n_out.value])
+                    llm.n_tokens = n_out.value
+                    return
+            llm.reset()
+            llm.eval(toks)
+            arr = (llama_cpp.llama_token * len(toks))(*toks)
+            tmp = state_path + ".tmp"
+            if llama_cpp.llama_state_save_file(llm._ctx.ctx, tmp.encode("utf-8"), arr, len(toks)):
+                os.replace(tmp, state_path)
+        except Exception:
+            pass
+
     def warm_up(self):
         """First inference after loading is 2-3x slower (page-in, thread spin-up).
         Do it now, on silence, so the user's first dictation is already fast."""
@@ -410,7 +460,8 @@ class EnginesMixin:
             silence = np.zeros(16000, dtype=np.float32)
             list(self.whisper_model.transcribe(silence, beam_size=1, language="en", vad_filter=False)[0])
             if self.local_llm:
-                self._format_text_local("warm up", self.config.get("last_language") or "en", max_tokens=4, quiet=True)
+                self._warm_up_prefix()
+                self._format_text_local("warm up", self.config.get("last_language") or "en", max_tokens=1, quiet=True)
             log(f"[Ready] Engines warmed up in {time.time() - t0:.2f}s.")
         except Exception as e:
             log(f"[Warm-up] Skipped ({e}).")
@@ -426,7 +477,8 @@ class EnginesMixin:
         t0 = time.time()
         try:
             with self.engine_lock:
-                self._format_text_local("warm up", self.config.get("last_language") or "en", max_tokens=4, quiet=True)
+                self._warm_up_prefix()
+                self._format_text_local("warm up", self.config.get("last_language") or "en", max_tokens=1, quiet=True)
             log(f"[AI] Ready ({time.time() - t0:.0f}s warm-up).")
         except Exception as e:
             log(f"[Warm-up] Skipped ({e}).")
@@ -505,10 +557,15 @@ class EnginesMixin:
                 while context and count(context) > self.PROMPT_TOKENS // 3:
                     context = context.split(" ", 1)[1] if " " in context else ""
                 budget = self.PROMPT_TOKENS - count(context)
-                items = words.rstrip(".").split(", ") if words else []
-                while items and count(", ".join(items) + ".") > budget:
-                    items.pop()
-                words = ", ".join(items) + "." if items else ""
+                cache_key = (id(tokenizer), words, budget)
+                if getattr(self, "_whisper_words_key", None) == cache_key:
+                    words = self._whisper_words_val
+                else:
+                    items = words.rstrip(".").split(", ") if words else []
+                    while items and count(", ".join(items) + ".") > budget:
+                        items.pop()
+                    words = ", ".join(items) + "." if items else ""
+                    self._whisper_words_key, self._whisper_words_val = cache_key, words
             except Exception:
                 pass
         return " ".join(p for p in (context, words) if p) or None
@@ -570,10 +627,10 @@ class EnginesMixin:
         if use_llm and self.ai_mode != "off" and self.local_llm:
             # "Um, yes." is a short clean phrase once the leading filler is gone.
             stripped = speak_text.strip_leading_fillers(text, lang)
+            fast_path = self.config.get("llm_fast_path", True) and not hint_needs_llm
             # A dictionary word that is already spelled right (or that
             # apply_casing fixes below) is no reason to wait for Qwen.
-            if (self.config.get("llm_fast_path", True) and not hint_needs_llm
-                    and not speak_text.needs_llm(stripped, lang)):
+            if fast_path and not speak_text.needs_llm(stripped, lang):
                 text = speak_text.light_cleanup(stripped) if stripped else ""
                 if verbose:
                     log(f"[Fast path] Short clean phrase, LLM skipped: \"{text}\"")
@@ -582,13 +639,30 @@ class EnginesMixin:
                 # filler sounds) before Qwen, and keeps it if Qwen fails.
                 text = speak_text.prepare_for_llm(text, lang, commands=not meeting)
                 if text:
-                    if stats is not None:
-                        stats["llm"] = True
-                    enhanced = self.format_text(text, lang, dict_hint, quiet=not verbose, meeting=meeting)
-                    if enhanced:
-                        text = enhanced
+                    parts = speak_text.split_clean_sentences(text, lang, meeting=meeting) if fast_path else [("", text, False)]
+                    if all(clean for _, _, clean in parts):
+                        text = speak_text.light_cleanup(text)
                         if verbose:
-                            log(f"[AI Formatted]: \"{text}\"")
+                            log(f"[Fast path] Clean after rule pass, LLM skipped: \"{text}\"")
+                    else:
+                        if stats is not None:
+                            stats["llm"] = True
+                        if len(parts) == 1:
+                            enhanced = self.format_text(text, lang, dict_hint, quiet=not verbose, meeting=meeting)
+                        else:
+                            out = []
+                            for sep, part, clean in parts:
+                                if clean:
+                                    piece = speak_text.light_cleanup(part)
+                                else:
+                                    piece = self.format_text(part, lang, dict_hint, quiet=not verbose, meeting=meeting) or speak_text.light_cleanup(part)
+                                if piece:
+                                    out.append((sep if out else "") + piece)
+                            enhanced = "".join(out)
+                        if enhanced:
+                            text = enhanced
+                            if verbose:
+                                log(f"[AI Formatted]: \"{text}\"")
 
         # Deterministic safety net: dictionary spellings always win.
         return self.dictionary.apply_casing(text)
@@ -676,9 +750,14 @@ class EnginesMixin:
             if max_tokens is None:
                 # Output is roughly as long as the input; budget 1.5x + slack and
                 # never exceed what fits in the context window.
+                prefix = _cleanup_prefix(fmt)
+                prefix_key = (id(self.local_llm), prefix)
+                if getattr(self, "_prefix_tokens_key", None) != prefix_key:
+                    self._prefix_tokens = len(self.local_llm.tokenize(prefix.encode("utf-8"), add_bos=False, special=True))
+                    self._prefix_tokens_key = prefix_key
                 n_in = len(self.local_llm.tokenize(text.encode("utf-8"), add_bos=False))
                 # special=True: the chat markers are one token each, as in the call.
-                n_prompt = len(self.local_llm.tokenize(prompt.encode("utf-8"), add_bos=False, special=True))
+                n_prompt = self._prefix_tokens + len(self.local_llm.tokenize(prompt[len(prefix):].encode("utf-8"), add_bos=False, special=True))
                 max_tokens = max(16, min(int(n_in * 1.5) + 32, self.llm_ctx - n_prompt - 8))
             res = self.local_llm(prompt, max_tokens=max_tokens, temperature=0.1, stop=chat_stop(fmt))
             # rstrip per line: Qwen3 writes Markdown line breaks ("  \n").
@@ -874,7 +953,10 @@ class LiveTranscriber:
             # The previous piece with text, as _clean_groups sees it.
             previous = next((p for p in reversed(self.pieces) if p["text"]), None)
             ends_at_pauses = at_pause and (previous is None or previous.get("at_pause", True))
-            if clean and text and ends_at_pauses:
+            tail = text.rstrip() if text else ""
+            complete = tail[-1:] in ".!?" and not tail.endswith("...")
+            continues = bool(previous and text and speak_text.continues_previous(previous["text"], text, lang))
+            if clean and text and ends_at_pauses and complete and not continues:
                 try:
                     cleaned = self.app.clean_text(text, lang, verbose=False)
                 except Exception as e:

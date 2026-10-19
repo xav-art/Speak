@@ -27,6 +27,7 @@ How the dictionary is used in the pipeline (see speak.py):
                ('øresund bridge' -> 'Øresund Bridge', 'sap' -> 'SAP').
 """
 
+import functools
 import json
 import os
 import re
@@ -97,6 +98,7 @@ def _fold(s):
     return unicodedata.normalize("NFC", s).casefold()
 
 
+@functools.lru_cache(maxsize=512)
 def _word_pattern(word):
     return re.compile(r"(?<!\w)" + re.escape(word).replace(r"\ ", r"\s+") + r"(?!\w)", re.IGNORECASE)
 

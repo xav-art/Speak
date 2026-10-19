@@ -1591,7 +1591,10 @@ class MeetingManager:
             n_joined = sum(k != v for k, v in mapping.items())
             if n_joined:
                 diar[name] = [(s, e, mapping.get(c, c)) for s, e, c in segs]
-                embs = self._cluster_embeddings(extractor, audio_by_stream[name], diar[name])
+                merged = {v for k, v in mapping.items() if k != v}
+                embs = {c: e for c, e in embs.items() if mapping.get(c, c) == c and c not in merged}
+                embs.update(self._cluster_embeddings(
+                    extractor, audio_by_stream[name], [s for s in diar[name] if s[2] in merged]))
                 self.log(f"[Meeting] Joined {n_joined} split voice(s) in the "
                          f"{'microphone' if name == 'mic' else 'call audio'}.")
             embs_by_stream[name] = embs

@@ -225,7 +225,7 @@ BULLET_COMMANDS = ("bullet point", "aufzählungspunkt")
 SCRATCH_COMMANDS = ("scratch that", "delete that", "slet det", "streich das", "efface ça")
 # Cues that the speaker takes back the words just before them.
 CORRECTION_CUES = ("no wait", "sorry", "i mean", "nej vent", "undskyld", "jeg mener", "nein warte",
-                   "ich meine", "non attends", "pardon", "je veux dire") + SCRATCH_COMMANDS
+                   "entschuldigung", "ich meine", "non attends", "pardon", "je veux dire") + SCRATCH_COMMANDS
 
 
 def _phrase_alternation(phrases):
@@ -422,6 +422,82 @@ _NEGATIONS = {"not", "no", "never", "dont", "doesnt", "didnt", "cant", "cannot",
               "ikke", "aldrig", "nej", "intet", "ingen", "ingenting", "nicht", "kein", "keine", "keinen",
               "keiner", "nie", "niemals", "nein", "nichts", "niemand", "kaum", "pas", "ne", "jamais", "non",
               "rien", "personne", "aucun", "aucune"}
+_LEADING_DISCOURSE = (_DISCOURSE_WORDS | {"ah", "oh", "eh", "hør", "also", "ben", "bah", "wait", "vent", "warte",
+                                          "attends", "yes", "no", "nej", "nein", "non"})
+
+
+def _has_repeat(words):
+    """Whether 1 to 4 words are repeated back-to-back ("the the", "we need to, we need to")."""
+    return any(words[i:i + k] == words[i + k:i + 2 * k]
+               for k in (1, 2, 3, 4) for i in range(len(words) - 2 * k + 1))
+
+
+def is_clean_text(text, lang=None, meeting=False, _before_newline=False):
+    """Whether text after prepare_for_llm is already properly capitalized,
+    punctuated and free of stutters, fillers, commands or corrections, so the
+    LLM cleanup can be skipped."""
+    s = text.strip()
+    if not s:
+        return True
+    if "\n" in s:
+        lines = [line for line in s.split("\n") if line.strip()]
+        if any(line.lstrip().startswith(("-", "•", "*")) for line in lines):
+            return False
+        return all(is_clean_text(line, lang, meeting, _before_newline=(i < len(lines) - 1))
+                   for i, line in enumerate(lines))
+    if s.lstrip().startswith(("-", "•", "*")):
+        return False
+    end_ok = (s[-1] in ".!?,") if _before_newline else (s[-1] in ".!?")
+    if not (s[0].isupper() or _has_inner_capital(s)) or not end_ok:
+        return False
+    words = words_of(s)
+    if _has_repeat(words) or has_disfluency(s, lang) or has_soft_filler(s, lang):
+        return False
+    if _contains_phrase(words, COMMAND_PHRASES) or _contains_phrase(words, CORRECTION_CUES):
+        return False
+    if (lang == "da" and "punkt" in words) or (lang == "fr" and "puce" in words):
+        return False
+    if words and words[0] in _LEADING_DISCOURSE and (meeting or re.match(r"^\w+,", s)):
+        return False
+    if len(words) > 12 and not any(p in s[:-1] for p in ",;:–-"):
+        return False
+    clauses = re.split(r"[,;:–-]\s*", s[:-1])
+    if any(len(words_of(c)) > 20 for c in clauses):
+        return False
+    return True
+
+
+def split_clean_sentences(text, lang=None, meeting=False):
+    """[(separator, chunk, is_clean)] for text after prepare_for_llm.
+    Independent sentences that are already clean keep their text without an
+    LLM pass, while sentences that still need cleanup are grouped for the LLM."""
+    if is_clean_text(text, lang, meeting=meeting):
+        return [("", text, True)]
+    if any(line.lstrip().startswith(("-", "•", "*")) for line in text.split("\n")):
+        return [("", text, False)]
+    sents = sentences(text, lang)
+    if len(sents) <= 1:
+        return [("", text, False)]
+    groups = []
+    for sep, sent in sents:
+        if not sent:
+            continue
+        if groups and ("\n" in sep or continues_previous(groups[-1][1], sent, lang)):
+            prev_sep, prev_text = groups[-1]
+            groups[-1] = (prev_sep, prev_text + sep + sent)
+        else:
+            groups.append((sep, sent))
+    if len(groups) <= 1:
+        return [("", text, False)]
+    merged = []
+    for sep, chunk in groups:
+        clean = is_clean_text(chunk, lang, meeting=meeting)
+        if merged and merged[-1][2] == clean:
+            prev_sep, prev_chunk, _ = merged[-1]
+            merged[-1] = (prev_sep, prev_chunk + sep + chunk, clean)
+        else:
+            merged.append((sep, chunk, clean))
+    return merged
 
 
 def _norm_word(word):

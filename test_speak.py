@@ -3013,5 +3013,61 @@ class TestPhase5ReviewCases(unittest.TestCase):
         self.assertEqual(refreshed, [1])
 
 
+class TestSpeedOptimizations(unittest.TestCase):
+    def test_is_clean_text_detects_clean_and_dirty_inputs(self):
+        self.assertTrue(st.is_clean_text("Can you check the invoice and call the supplier?", "en"))
+        self.assertTrue(st.is_clean_text("Hi Anna,\nThanks for the meeting yesterday.", "en"))
+        # Bullet lists go to the LLM so the intro sentence gets a colon; soft fillers,
+        # stutters, self-corrections, unexecuted commands, or missing punctuation also need the LLM.
+        self.assertFalse(st.is_clean_text("Here are the steps.\n- First item.\n- Second item.", "en"))
+        self.assertFalse(st.is_clean_text("It was, like, really good.", "en"))
+        self.assertFalse(st.is_clean_text("We need to, we need to finalize it.", "en"))
+        self.assertFalse(st.is_clean_text("Send send the report.", "en"))
+        self.assertFalse(st.is_clean_text("Let's meet on Tuesday, sorry, Wednesday.", "en"))
+        self.assertFalse(st.is_clean_text("Die Nummer ist vierzig, Entschuldigung, fünfzig.", "de"))
+        self.assertFalse(st.is_clean_text("Hi Anna new line thanks.", "en"))
+        self.assertFalse(st.is_clean_text("missing capital and period", "en"))
+        self.assertFalse(st.is_clean_text("Yeah, I will do it.", "en", meeting=True))
+
+    def test_selective_sentence_cleanup_sends_only_dirty_sentences_to_llm(self):
+        from types import SimpleNamespace
+        seen = []
+        app = speak.SpeakApp.__new__(speak.SpeakApp)
+        app.ai_mode, app.local_llm, app.config = "local", object(), {}
+        app.dictionary = SimpleNamespace(prepare=lambda t, l: (t, "", [], False), apply_casing=lambda t: t)
+        app.format_text = lambda text, lang, *a, **kw: seen.append(text) or "We need to finalize the campaign."
+        raw = "First sentence is clean. Second sentence, uh, is also clean. We need to, we need to finalize the campaign."
+        out = app.clean_text(raw, "en", verbose=False)
+        self.assertEqual(seen, ["We need to, we need to finalize the campaign."])
+        self.assertEqual(out, "First sentence is clean. Second sentence is also clean. We need to finalize the campaign.")
+
+    def test_german_entschuldigung_self_correction_is_faithful(self):
+        self.assertTrue(st.cleanup_is_faithful(
+            "Die Bestellnummer ist vierzig, Entschuldigung, fünfzig.",
+            "Die Bestellnummer ist fünfzig.", "de"))
+
+    def test_live_transcriber_skips_mid_recording_cleanup_for_incomplete_or_continuing_piece(self):
+        import threading
+        from types import SimpleNamespace
+        pieces = iter(["We need to finalize the", "campaign before Friday.", "No wait, before Thursday."])
+        cleaned = []
+        app = SimpleNamespace(
+            engine_lock=threading.RLock(),
+            transcribe=lambda audio, **kw: (next(pieces), "en", 0.9),
+            clean_text=lambda text, lang, verbose=True: cleaned.append(text) or f"<{text}>",
+        )
+        live = speak_engines.LiveTranscriber(app, [], 16000)
+        chunk = np.zeros(16000, np.float32)
+        live._transcribe(chunk, at_pause=True)   # no ending punctuation -> not cleaned mid-recording
+        live._transcribe(chunk, at_pause=True)   # follows an open sentence -> not cleaned mid-recording
+        live._transcribe(chunk, at_pause=True)   # starts with a correction cue -> not cleaned mid-recording
+        self.assertEqual(cleaned, [])
+
+    def test_word_pattern_is_cached(self):
+        import speak_dictionary as sd_mod
+        self.assertIs(sd_mod._word_pattern("Power BI"), sd_mod._word_pattern("Power BI"))
+
+
 if __name__ == "__main__":
     unittest.main()
+

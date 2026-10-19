@@ -103,7 +103,7 @@ def main():
         sys.exit("The local LLM could not be loaded: run `speak.py --download-models` first.")
     # Fills the KV cache with the fixed prompt, as the app's warm-up does.
     t_warm = time.time()
-    app.clean_text("Um, warm up the model, please, and, uh, check it.", "en", verbose=False)
+    app.warm_up_llm()
     t_warm = time.time() - t_warm
 
     rows, t_all = [], time.time()
